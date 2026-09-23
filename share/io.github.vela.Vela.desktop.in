@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Name=Vela Terminal
+Name[zh_CN]=Vela 终端
+GenericName=Terminal
+GenericName[zh_CN]=终端
+Comment=Modern terminal with tabs, splits, themes and a command palette
+Comment[zh_CN]=支持标签页、分屏、主题与命令面板的现代终端
+Exec=@EXEC@ %U
+Icon=io.github.vela.Vela
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;command;prompt;
+Keywords[zh_CN]=终端;命令行;控制台;shell;
+StartupNotify=true
+StartupWMClass=vela
+Actions=new-window;new-tab;
+
+[Desktop Action new-window]
+Name=New Window
+Name[zh_CN]=新建窗口
+Exec=@EXEC@
+
+[Desktop Action new-tab]
+Name=New Tab
+Name[zh_CN]=新建标签页
+Exec=@EXEC@ --working-directory %f
