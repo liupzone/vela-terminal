@@ -451,6 +451,25 @@ class Smoke:
                 return text
         return text
 
+    def wait_for_layout(self, leaves, timeout: float = 4.0) -> bool:
+        """Wait until every pane has a real allocation.
+
+        Rebuilding the pane tree leaves the new containers at 1x1 until GTK runs
+        another layout pass, so measuring right after a split or close reads a
+        transient state rather than a bug.
+        """
+        waited = 0.0
+        while waited < timeout:
+            self.pump(0.25)
+            waited += 0.25
+            if all(
+                leaf.view.get_allocated_width() > 20
+                and leaf.view.get_allocated_height() > 20
+                for leaf in leaves
+            ):
+                return True
+        return False
+
     @staticmethod
     def pump(seconds: float) -> None:
         """Run a nested main loop for ``seconds`` so events and PTY output land."""
@@ -927,10 +946,11 @@ class Smoke:
         )
         # Closing a pane reparents the survivors into a freshly built container.
         # They must all still be attached to the widget tree and have a usable
-        # size (mapped is not checked here: it also depends on the compositor
-        # having painted the new container, which is covered by step_splits).
-        self.pump(0.4)
+        # size.  The rebuilt panes only report a real size after a layout pass,
+        # so wait for one before measuring (measuring immediately shows the
+        # transient 1x1 of a container that has not been negotiated yet).
         survivors = tab.container.leaves()
+        settled = self.wait_for_layout(survivors)
         self.check(
             "remaining panes stay in the widget tree",
             survivors and all(leaf.view.get_parent() is not None for leaf in survivors),
@@ -938,7 +958,8 @@ class Smoke:
         )
         self.check(
             "remaining panes keep a usable size",
-            all(
+            settled
+            and all(
                 leaf.view.get_allocated_width() > 20
                 and leaf.view.get_allocated_height() > 20
                 for leaf in survivors

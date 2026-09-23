@@ -544,8 +544,23 @@ class PaneContainer(Gtk.Box):
         # existed.
         self._layout_host.queue_resize()
         self.queue_resize()
+        # Closing a pane rebuilds every GtkPaned; the new ones need one more
+        # negotiation pass before the survivors report a real size, otherwise a
+        # just-closed layout shows every pane as 1x1.
+        GLib.idle_add(self._settle_layout)
         if self.active is not None:
             self.set_active(self.active, focus=False)
+
+    def _settle_layout(self) -> bool:
+        """Ask for a final resize once the rebuilt tree is idle."""
+        if not self.get_realized():
+            return False
+        self.queue_resize()
+        for leaf in self.leaves():
+            widget = self._widget_for(leaf)
+            if widget is not None and widget.get_parent() is not None:
+                widget.queue_resize()
+        return False
 
     def _forget_paneds(self, node: Optional[Node]) -> None:
         if node is None or isinstance(node, Leaf):
