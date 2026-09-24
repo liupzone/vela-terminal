@@ -541,7 +541,7 @@ SPARK_SAMPLES = 60
 # than this shows only the first this many).
 MAX_CORE_CELLS = 256
 # Height of one row of per-core meters, in pixels.
-CORE_ROW_HEIGHT = 18
+CORE_ROW_HEIGHT = 17
 
 
 class Sparkline(Gtk.DrawingArea):
@@ -716,8 +716,8 @@ class SysinfoPanel(Gtk.Box):
         header.pack_end(self._updated, False, False, 0)
         self.pack_start(header, False, False, 0)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        content.set_border_width(10)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        content.set_border_width(8)
 
         self._spark = Sparkline()
         content.pack_start(self._spark, False, False, 0)
@@ -730,12 +730,17 @@ class SysinfoPanel(Gtk.Box):
         # screen (the container kept a 1px height and the rows stayed invisible,
         # no matter which resize call was used).  Extra cells are hidden until
         # the real core count is known.
-        self._core_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._core_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         # os.cpu_count() matches the number of cpuN lines in /proc/stat, and it
         # is known before the panel is shown, so the exact number of cells can be
         # created up front (see the note above about adding children later).
         core_total = max(1, min(MAX_CORE_CELLS, os.cpu_count() or 1))
-        self._build_core_cells([f"cpu{index}" for index in range(core_total)])
+        self._core_columns_count = 2
+        self._relayout_pending = False
+        self._build_core_cells([f"cpu{index}" for index in range(core_total)], 2)
+        # Re-flow the per-core grid when the pane is resized: a wide pane fits
+        # more columns and needs less vertical space.
+        self.connect("size-allocate", lambda *_: self._relayout_cores_if_needed())
         # Not expanding: the content column is taller than the viewport, so GTK
         # compresses expanding children and the core rows would be squeezed.
         content.pack_start(self._core_box, False, False, 0)
@@ -746,15 +751,15 @@ class SysinfoPanel(Gtk.Box):
         self._add_bar(content, "swap", "交换分区")
 
         self._add_section(content, "磁盘")
-        self._disk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._disk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         content.pack_start(self._disk_box, False, False, 0)
 
         self._add_section(content, "网络")
-        self._network_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._network_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         content.pack_start(self._network_box, False, False, 0)
 
         self._add_section(content, "终端进程")
-        self._process_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._process_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         content.pack_start(self._process_box, False, False, 0)
 
         self._add_section(content, "系统")
@@ -962,7 +967,19 @@ class SysinfoPanel(Gtk.Box):
             elif cell.get_visible():
                 cell.hide()
 
-    def _build_core_cells(self, labels: List[str]) -> None:
+    def _core_columns(self) -> int:
+        """How many core cells fit per row.
+
+        The per-core list is the tallest part of the panel, so a wide pane uses
+        more columns to stay inside one screenful instead of forcing a scroll.
+        """
+        width = self._core_box.get_allocated_width() or self.get_allocated_width()
+        if width <= 0:
+            return 2
+        # Each cell needs roughly 150px to show "核12 ▮▮▮ 24%".
+        return max(2, min(6, int(width // 150)))
+
+    def _build_core_cells(self, labels: List[str], columns: int = 2) -> None:
         container = self._core_box
         for child in list(container.get_children()):
             container.remove(child)
@@ -970,7 +987,7 @@ class SysinfoPanel(Gtk.Box):
         self._core_labels.clear()
         self._core_cells.clear()
         self._core_rows.clear()
-        columns = 2
+        self._core_columns_count = columns
         row: Optional[Gtk.Box] = None
         for index, label in enumerate(labels):
             if index % columns == 0:
@@ -998,6 +1015,29 @@ class SysinfoPanel(Gtk.Box):
             self._core_labels[label] = percent
             self._core_cells[label] = cell
         container.show_all()
+
+    def _relayout_cores_if_needed(self) -> None:
+        """Rebuild the core grid when the pane is wide enough for more columns.
+
+        Deferred to an idle callback: during ``size-allocate`` the core box has
+        not been given its new width yet, so reading it there always reports the
+        old value and the grid never re-flows.
+        """
+        if self._relayout_pending:
+            return
+        self._relayout_pending = True
+        GLib.idle_add(self._apply_core_columns)
+
+    def _apply_core_columns(self) -> bool:
+        self._relayout_pending = False
+        wanted = self._core_columns()
+        if wanted == getattr(self, "_core_columns_count", 2):
+            return False
+        labels = list(self._core_cells)
+        if not labels:
+            return False
+        self._build_core_cells(labels, wanted)
+        return False
 
     def _render_disks(self, disks: Sequence[DiskUsage]) -> None:
         for child in list(self._disk_box.get_children()):

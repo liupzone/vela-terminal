@@ -201,6 +201,9 @@ class ClickHandlerTests(unittest.TestCase):
             TerminalView._on_terminal_button_press.__get__(view, FakeView)
         )
         view._path_at = TerminalView._path_at.__get__(view, FakeView)
+        # The focus grab is deferred to an idle callback; the stand-in records it
+        # instead of touching a real widget.
+        view._claim_keyboard_focus = lambda: False
         # The menu itself is covered by test_terminal_menu; here it is stubbed so
         # the test only exercises which button reaches which code path.
         view._show_context_menu = lambda _event: None

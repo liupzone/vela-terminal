@@ -55,6 +55,7 @@ DEFAULTS: Dict[str, Any] = {
         "close_pane_on_exit": True,
         "close_window_on_last_exit": True,
         "close_on_abnormal_exit": False,
+        "restore_session": False,
     },
     "window": {
         "width": 1080,
@@ -79,6 +80,7 @@ DEFAULTS: Dict[str, Any] = {
         "confirm_unsaved": True,
         "reveal_on_ctrl_shift_click": True,
     },
+    "layouts": {},
     "filebrowser": {
         "enabled": False,
         "follow_terminal": True,
@@ -109,6 +111,9 @@ DEFAULTS: Dict[str, Any] = {
         "find_previous": "<Ctrl><Shift>H",
         "command_palette": "<Ctrl><Shift>P",
         "toggle_filebrowser": "<Ctrl><Shift>D",
+        "rename_tab": "<Ctrl><Shift>R",
+        "save_layout": "<Ctrl><Shift>F2",
+        "restore_layout": "<Ctrl><Shift>F3",
         "font_increase": "<Ctrl>plus",
         "font_decrease": "<Ctrl>minus",
         "font_reset": "<Ctrl>0",
@@ -307,6 +312,7 @@ class Config:
             "close_pane_on_exit",
             "close_window_on_last_exit",
             "close_on_abnormal_exit",
+            "restore_session",
         ):
             behavior[key] = _coerce_bool(behavior.get(key), DEFAULTS["behavior"][key])
         for key in ("shell", "working_directory", "word_char_exceptions"):

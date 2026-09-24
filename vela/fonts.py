@@ -14,6 +14,7 @@ that as a "font" would silently break text rendering.
 from __future__ import annotations
 
 import os
+import glob
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,12 @@ _SFNT_MAGICS = (b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf", b"wOFF", b"wOF2"
 _FONT_EXTENSIONS = (".ttf", ".otf", ".ttc")
 
 FONT_DIR_ENV = "VELA_FONT_DIR"
+
+#: Where Windows keeps its fonts, relative to a mount point.
+WINDOWS_FONT_SUBDIR = os.path.join("Windows", "Fonts")
+
+#: Extra locations to probe, overriding the glob search (used by tests).
+WINDOWS_FONT_DIR_ENV = "VELA_WINDOWS_FONT_DIR"
 
 
 def font_dir() -> str:
@@ -154,6 +161,47 @@ def monospace_families() -> List[str]:
 
 def is_installed(family: str) -> bool:
     return family in set(monospace_families())
+
+
+def cjk_families() -> List[str]:
+    """Installed families that can render Chinese, sorted.
+
+    Used for the fallback-font picker: the fallback is typically proportional
+    (微软雅黑, Noto Sans CJK) so it never appears in the monospace list.
+    """
+    try:
+        import gi
+
+        gi.require_version("Pango", "1.0")
+        gi.require_version("PangoCairo", "1.0")
+        from gi.repository import PangoCairo
+
+        families = PangoCairo.FontMap.get_default().list_families()
+    except Exception:  # pragma: no cover - Pango unavailable
+        return []
+    names: List[str] = []
+    for family in families:
+        name = family.get_name()
+        if _family_looks_cjk(name):
+            names.append(name)
+    return sorted(set(names), key=lambda value: value.lower())
+
+
+#: Name fragments of families that carry CJK coverage.  Pango exposes no direct
+#: "has Chinese glyphs" flag, and shaping every family on the system is slow, so
+#: the well-known CJK families are matched by name.
+_CJK_NAME_HINTS = (
+    "cjk", "yahei", "雅黑", "simsun", "simhei", "songti", "heiti", "kaiti",
+    "fangsong", "dengxian", "noto sans sc", "noto serif sc", "source han",
+    "wenquanyi", "micro hei", "zen hei", "droid sans fallback", "uming", "ukai",
+    "arphic", "wqy", "pingfang", "hiragino", "heiti sc", "microsoft jhenghei",
+    "sarasa", "maple", "lxgw", "hanserif", "hansans",
+)
+
+
+def _family_looks_cjk(name: str) -> bool:
+    lowered = name.lower()
+    return any(hint in lowered for hint in _CJK_NAME_HINTS)
 
 
 def installed_catalog_keys() -> List[str]:
@@ -308,3 +356,169 @@ def installed_font_files(directory: Optional[str] = None) -> List[str]:
             if name.lower().endswith(_FONT_EXTENSIONS):
                 found.append(os.path.join(current, name))
     return sorted(found)
+
+
+# ---------------------------------------------------------------------------
+# fonts that already exist on this machine
+# ---------------------------------------------------------------------------
+@dataclass
+class LocalFont:
+    """A font file found on the machine that can be imported."""
+
+    key: str
+    name: str
+    description: str
+    #: Glob patterns, relative to a Windows mount, that locate the files.
+    patterns: Tuple[str, ...]
+
+    def resolve(self, root: str) -> List[str]:
+        """Absolute paths of the files for this font under ``root``."""
+        found: List[str] = []
+        for pattern in self.patterns:
+            found.extend(glob.glob(os.path.join(root, pattern)))
+        return sorted(set(found))
+
+
+#: Fonts shipped with Windows.  Vela never downloads these: they are
+#: proprietary, and the only legitimate copy is the one already on the user's
+#: machine (a mounted Windows partition).  Importing makes them available to
+#: Vela without touching the original files.
+LOCAL_CATALOG: Tuple[LocalFont, ...] = (
+    LocalFont(
+        key="microsoft-yahei",
+        name="微软雅黑",
+        description="Windows 中文界面字体，屏幕显示清晰（常规/粗体/细体）",
+        patterns=("msyh.ttc", "msyhbd.ttc", "msyhl.ttc"),
+    ),
+    LocalFont(
+        key="microsoft-dengxian",
+        name="等线",
+        description="Windows 10 起的中文正文字体，笔画较细",
+        patterns=("Deng.ttf", "Dengb.ttf", "Dengl.ttf"),
+    ),
+    LocalFont(
+        key="simhei",
+        name="黑体",
+        description="Windows 经典中文黑体",
+        patterns=("simhei.ttf",),
+    ),
+    LocalFont(
+        key="simsun",
+        name="宋体",
+        description="Windows 经典中文宋体（含 NSimSun）",
+        patterns=("simsun.ttc",),
+    ),
+    LocalFont(
+        key="kaiti",
+        name="楷体",
+        description="Windows 中文楷体",
+        patterns=("STKAITI.TTF", "simkai.ttf"),
+    ),
+)
+
+
+def local_catalog() -> Tuple[LocalFont, ...]:
+    return LOCAL_CATALOG
+
+
+def find_local(key: str) -> Optional[LocalFont]:
+    for entry in LOCAL_CATALOG:
+        if entry.key == key:
+            return entry
+    return None
+
+
+def windows_font_dirs() -> List[str]:
+    """Directories holding a Windows font collection, if any.
+
+    Looks at every mounted filesystem for a ``Windows/Fonts`` directory.  The
+    environment override lets tests point at a fixture instead of a real mount.
+    """
+    override = os.environ.get(WINDOWS_FONT_DIR_ENV)
+    if override:
+        return [override] if os.path.isdir(override) else []
+    roots: List[str] = []
+    # Typical mount points: /media/<user>/<label>, /mnt/<label>, /run/media/...
+    for base in ("/media/*/*", "/mnt/*", "/run/media/*/*", "/media/*"):
+        for candidate in glob.glob(base):
+            fonts = os.path.join(candidate, WINDOWS_FONT_SUBDIR)
+            if os.path.isdir(fonts):
+                roots.append(fonts)
+    return sorted(set(roots))
+
+
+def available_local_fonts() -> List[Tuple[LocalFont, List[str]]]:
+    """Local catalog entries that exist on this machine, with their files."""
+    found: List[Tuple[LocalFont, List[str]]] = []
+    for root in windows_font_dirs():
+        for entry in LOCAL_CATALOG:
+            paths = entry.resolve(root)
+            if paths:
+                found.append((entry, paths))
+    return found
+
+
+def is_local_installed(key: str) -> bool:
+    """Whether a local font has already been imported into Vela's font dir."""
+    entry = find_local(key)
+    if entry is None:
+        return False
+    package_dir = os.path.join(font_dir(), entry.key)
+    return os.path.isdir(package_dir) and bool(
+        [
+            name
+            for name in os.listdir(package_dir)
+            if name.lower().endswith(_FONT_EXTENSIONS)
+        ]
+    )
+
+
+def import_local(key: str, directory: Optional[str] = None) -> List[str]:
+    """Copy a machine-local font into Vela's font directory.
+
+    The source files are only read; they are never modified or removed.  Only
+    files that pass the font magic check are copied, and the package directory
+    is replaced so a re-import cannot accumulate stale files.
+    """
+    entry = find_local(key)
+    if entry is None:
+        raise DownloadError(f"未知字体：{key}")
+    sources: List[str] = []
+    for root in windows_font_dirs():
+        sources.extend(entry.resolve(root))
+    if not sources:
+        raise DownloadError(
+            "没有找到可导入的字体文件；请确认 Windows 分区已挂载"
+        )
+    target_root = directory or font_dir()
+    package_dir = os.path.join(target_root, entry.key)
+    # Validate before touching the target so a bad source leaves nothing behind.
+    valid: List[str] = []
+    for source in sources:
+        try:
+            with open(source, "rb") as handle:
+                head = handle.read(4)
+        except OSError as error:
+            raise DownloadError(f"无法读取 {os.path.basename(source)}：{error}")
+        if not looks_like_font(head):
+            raise DownloadError(
+                f"{os.path.basename(source)} 不是有效的字体文件"
+            )
+        valid.append(source)
+    if not valid:
+        raise DownloadError("没有可导入的字体文件")
+    if os.path.isdir(package_dir):
+        shutil.rmtree(package_dir, ignore_errors=True)
+    os.makedirs(package_dir, exist_ok=True)
+    imported: List[str] = []
+    for source in valid:
+        destination = os.path.join(package_dir, os.path.basename(source))
+        try:
+            shutil.copy2(source, destination)
+        except OSError as error:
+            raise DownloadError(
+                f"复制 {os.path.basename(source)} 失败：{error}"
+            )
+        imported.append(destination)
+    refresh_font_cache()
+    return imported

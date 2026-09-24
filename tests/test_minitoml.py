@@ -95,6 +95,34 @@ class ParseTests(unittest.TestCase):
 
 
 class DumpTests(unittest.TestCase):
+    def test_non_ascii_keys_are_quoted(self):
+        """TOML bare keys are ASCII only; layout names are often Chinese."""
+        original = {"layouts": {"工作": {"name": "工作"}}}
+        text = minitoml.dumps(original)
+        self.assertIn('"工作"', text)
+        self.assertEqual(minitoml.loads(text), original)
+
+    def test_keys_with_dots_or_spaces_are_quoted(self):
+        original = {"a": {"has space": 1, "has.dot": 2}}
+        text = minitoml.dumps(original)
+        self.assertEqual(minitoml.loads(text), original)
+
+    def test_inline_tables_round_trip(self):
+        """Nested structures are written as inline tables and read back."""
+        original = {
+            "layouts": {
+                "x": {
+                    "tabs": [
+                        {
+                            "title": "dev",
+                            "tree": {"type": "split", "first": {"type": "pane"}},
+                        }
+                    ]
+                }
+            }
+        }
+        self.assertEqual(minitoml.loads(minitoml.dumps(original)), original)
+
     def test_round_trip(self):
         original = {
             "appearance": {"theme": "nord", "font_size": 12.0, "bold": True},

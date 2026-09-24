@@ -120,6 +120,7 @@ class TerminalView(Gtk.Box):
         self.theme = theme
         self._notify = notify or (lambda *_args, **_kwargs: None)
         self.exited = False
+        self.detached = False
         self.exit_status: Optional[int] = None
         self._title = ""
         self._directory = ""
@@ -516,9 +517,13 @@ class TerminalView(Gtk.Box):
         moving the cursor, mouse reporting to the running program), which is why
         only the cases we fully own return ``True``.
         """
-        # Any button press focuses the pane first, so clicking a split always
-        # makes it the active one.
+        # Any button press makes this pane the active one.  The focus grab is
+        # deferred to an idle callback: doing it inline runs *before* VTE's own
+        # button handling, and VTE then takes the keyboard focus back, leaving
+        # the highlight on the new pane while keystrokes still went to the old
+        # one (clicking a split appeared to do nothing).
         self.emit("focus-requested")
+        GLib.idle_add(self._claim_keyboard_focus)
 
         if event.button == 1:
             if not self._path_match_installed:
@@ -538,6 +543,19 @@ class TerminalView(Gtk.Box):
             self._show_context_menu(event)
             return True
 
+        return False
+
+    def _claim_keyboard_focus(self) -> bool:
+        """Take the keyboard focus once the current event has been processed."""
+        if not self.terminal.get_mapped() or self.terminal.is_focus():
+            return False
+        self.terminal.grab_focus()
+        # grab_focus() alone does not always stick when called while GTK is
+        # finishing a button press; setting the window's focus widget directly
+        # makes the keyboard follow the click reliably.
+        toplevel = self.get_toplevel()
+        if isinstance(toplevel, Gtk.Window):
+            toplevel.set_focus(self.terminal)
         return False
 
     def _on_terminal_button_release(self, _widget, event) -> bool:
@@ -661,6 +679,9 @@ class TerminalView(Gtk.Box):
     def _on_child_exited(self, _terminal, status: int) -> None:
         self.exited = True
         self.exit_status = status
+        if self.detached:
+            # The pane was replaced or closed on purpose; nothing to report.
+            return
         if self.config.get("behavior.show_exit_hint"):
             code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else status
             self.show_message(f"\r\n[进程已退出，状态码 {code}]\r\n")
@@ -680,6 +701,35 @@ class TerminalView(Gtk.Box):
         if path != self._directory:
             self._directory = path
             self.emit("directory-changed", path)
+
+    def refresh_directory(self) -> str:
+        """Re-read the shell's working directory from ``/proc``.
+
+        VTE only reports a directory when the shell tells it to, which requires
+        the shell-integration hook that ships in ``/etc/profile.d/vte-*.sh``.
+        That hook is installed by ``PROMPT_COMMAND``, which a non-login shell
+        never runs, so on a default setup ``get_current_directory_uri()`` stays
+        ``None`` forever and nothing that follows the directory ever moves.
+
+        ``/proc/<pid>/cwd`` is the shell's real working directory and needs no
+        cooperation from the shell.  It is read on demand (after a command the
+        user ran) rather than polled, so the cost is one ``readlink`` per use.
+        """
+        path = ""
+        pid = self.child_pid
+        if pid:
+            try:
+                path = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                path = ""
+        if not path or not os.path.isdir(path):
+            # Fall back to whatever VTE last reported, which is all there is
+            # when /proc is unavailable (another user's process, a container).
+            path = self._directory
+        if path and path != self._directory:
+            self._directory = path
+            self.emit("directory-changed", path)
+        return self._directory
 
     def _on_bell(self, _terminal) -> None:
         if not self.config.get("behavior.visual_bell"):
@@ -707,9 +757,21 @@ class TerminalView(Gtk.Box):
         self.emit("cursor-moved", int(column), int(row))
 
     # -- teardown --------------------------------------------------------
+    def detach(self) -> None:
+        """Mark this terminal as deliberately discarded.
+
+        Called when the pane is being replaced rather than closed, so the shell
+        exiting as a result must not be reported as an error.  Without this,
+        switching a pane to the system monitor popped "进程异常退出（被信号 1
+        终止）" because we were the ones who killed the shell.
+        """
+        self.detached = True
+
     def terminate(self) -> None:
         if self.exited:
             return
+        # A pane being replaced is not a failure; say so before the signal lands.
+        self.detached = True
         pid = self.child_pid
         if not pid:
             return

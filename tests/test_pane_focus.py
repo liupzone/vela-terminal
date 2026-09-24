@@ -44,7 +44,8 @@ class FakeView:
 class PaneContainerFocusTests(unittest.TestCase):
     def make_container(self, count=1):
         views = [FakeView(str(index)) for index in range(count)]
-        container = PaneContainer(make_view=lambda: views.pop(0))
+        # The factory receives the pane kind now that panels are panes too.
+        container = PaneContainer(make_view=lambda _kind="terminal": views.pop(0))
         first = container.bootstrap()
         return container, first
 
@@ -143,6 +144,66 @@ class PaneContainerFocusTests(unittest.TestCase):
         self.assertTrue(second.view.focused)
         container.close(second)
         self.assertTrue(first.view.focused)
+
+
+class FocusRingDrawingTests(unittest.TestCase):
+    """Rebuilding the pane tree must not gut the terminal views.
+
+    Regression: tearing down the paned tree detached *every* descendant, which
+    pulled the VTE widget out of its scroller and left that pane permanently
+    unrealized — it rendered blank and could not take keyboard focus, so
+    clicking a split appeared to do nothing.
+    """
+
+    def test_detach_keeps_pane_contents_intact(self):
+        """A TerminalView must be removed whole, keeping its own children."""
+        from vela.pane import PaneContainer
+
+        view = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        inner = Gtk.ScrolledWindow()
+        leaf_widget = Gtk.Label(label="terminal")
+        inner.add(leaf_widget)
+        view.pack_start(inner, True, True, 0)
+
+        container = PaneContainer(make_view=lambda: view)
+        container.bootstrap()
+        container._detach_children(view)
+
+        self.assertIs(inner.get_parent(), view, "内层容器不能被摘掉")
+        self.assertIs(leaf_widget.get_parent(), inner)
+
+    def test_detach_empties_nested_paneds(self):
+        """Nested panes are emptied so they can be destroyed safely."""
+        from vela.pane import PaneContainer
+
+        outer = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        inner = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        left = Gtk.Label(label="a")
+        right = Gtk.Label(label="b")
+        inner.pack1(left, True, True)
+        inner.pack2(right, True, True)
+        outer.pack1(inner, True, True)
+        outer.pack2(Gtk.Label(label="c"), True, True)
+
+        container = PaneContainer(make_view=lambda: Gtk.Box())
+        container._detach_children(outer)
+
+        self.assertIsNone(outer.get_child1())
+        self.assertIsNone(outer.get_child2())
+        self.assertIsNone(inner.get_child1())
+        self.assertIsNone(inner.get_child2())
+
+    def test_detach_ignores_non_paneds(self):
+        """A plain box is left alone (only paneds own disposable children)."""
+        from vela.pane import PaneContainer
+
+        box = Gtk.Box()
+        child = Gtk.Label(label="keep me")
+        box.pack_start(child, True, True, 0)
+
+        container = PaneContainer(make_view=lambda: Gtk.Box())
+        container._detach_children(box)
+        self.assertIs(child.get_parent(), box)
 
 
 class FocusRingDrawingTests(unittest.TestCase):

@@ -9,7 +9,7 @@ viewer while everything else goes to the desktop's default application.
 from __future__ import annotations
 
 import os
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import gi
 
@@ -27,6 +27,157 @@ COL_ICON = 4
 COL_PATH = 5
 COL_IS_DIR = 6
 COL_TOOLTIP = 7
+
+#: ``cd`` flags that mean "the previous directory"; handled as a special case
+#: rather than as a path, because ``-`` is not a legal directory name here.
+_CD_BACK = "-"
+
+
+def parse_cd(text: str) -> Optional[str]:
+    """The path a command-bar line asks for, or ``None`` if it is not a ``cd``.
+
+    Accepted forms are ``cd`` on its own (home), ``cd -`` (previous directory),
+    ``cd PATH`` and a bare ``PATH``.  Quoting is honoured so a directory with
+    spaces can be reached.  This is deliberately not a shell: no ``&&``, no
+    globbing, no expansion of anything except ``~`` and ``$VAR`` in the path.
+    """
+    text = text.strip()
+    if not text:
+        return None
+    tokens = _split_command(text)
+    if tokens is None:
+        return None
+    if not tokens:
+        return None
+    if tokens[0] == "cd":
+        rest = tokens[1:]
+    elif len(tokens) == 1 and _looks_like_path(tokens[0]):
+        # A bare path is the common case, so it is accepted as a shortcut.
+        rest = tokens
+    else:
+        return None
+    if not rest:
+        return "~"
+    if len(rest) > 1:
+        return None
+    return rest[0]
+
+
+def _looks_like_path(token: str) -> bool:
+    """Whether a bare word is meant as a path rather than a command.
+
+    Without this, ``ls`` would be read as "go to the directory named ls" and the
+    bar would quietly do something the user did not ask for.
+    """
+    if not token:
+        return False
+    if token in (_CD_BACK, "~", "..", ".") or token.startswith(("~", "/", "./", "../")):
+        return True
+    return "/" in token
+
+
+def split_for_completion(text: str) -> Tuple[str, str, str]:
+    """Split a half-typed line into ``(prefix, base, fragment)``.
+
+    ``prefix`` is what has to stay in front of the completed name (``"cd "`` or
+    an empty string), ``base`` is the directory the fragment is resolved against
+    (a raw, unexpanded string so it can be shown back to the user), and
+    ``fragment`` is the part being completed.  Completion works on the raw text
+    rather than on ``parse_cd``'s output so that what the user typed keeps its
+    own spelling: completing ``cd ~/ve`` must produce ``cd ~/vela-terminal``, not
+    an absolute path.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return "", "", ""
+    if stripped == "cd":
+        # The space is added as part of the completion, so Tab right after "cd"
+        # produces "cd name/" rather than gluing the name onto the command.
+        return "cd ", "", ""
+    if len(stripped) > 2 and stripped.startswith("cd") and stripped[2].isspace():
+        prefix = "cd "
+        rest = stripped[3:].strip()
+    else:
+        prefix, rest = "", stripped
+    if not rest:
+        return prefix, "", ""
+    if "/" in rest:
+        base, _, fragment = rest.rpartition("/")
+        return prefix, base + "/", fragment
+    return prefix, "", rest
+
+
+def completion_candidates(base: str, fragment: str, current: str) -> List[str]:
+    """Directory names under ``base`` that start with ``fragment``.
+
+    Only directories are offered: this bar navigates, so completing a file name
+    would produce something that cannot be entered.  Hidden directories are
+    offered only once the fragment itself starts with a dot, which is how shells
+    behave.
+    """
+    raw = base or current
+    expanded = os.path.expanduser(os.path.expandvars(raw)) if raw else ""
+    if not expanded:
+        expanded = current or os.path.expanduser("~")
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(current or os.path.expanduser("~"), expanded)
+    directory = os.path.normpath(expanded)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    candidates = []
+    for name in names:
+        if not name.startswith(fragment):
+            continue
+        if name.startswith(".") and not fragment.startswith("."):
+            continue
+        if os.path.isdir(os.path.join(directory, name)):
+            candidates.append(name)
+    return sorted(candidates)
+
+
+def _common_prefix(names: List[str]) -> str:
+    if not names:
+        return ""
+    shortest = min(names, key=len)
+    for index, char in enumerate(shortest):
+        if any(name[index] != char for name in names):
+            return shortest[:index]
+    return shortest
+
+
+def _split_command(text: str) -> Optional[List[str]]:
+    """Split on whitespace, honouring single and double quotes."""
+    tokens: List[str] = []
+    current: List[str] = []
+    quote = ""
+    started = False
+    for char in text:
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                current.append(char)
+            continue
+        if char in ("'", '"'):
+            quote = char
+            started = True
+            continue
+        if char.isspace():
+            if started or current:
+                tokens.append("".join(current))
+                current = []
+                started = False
+            continue
+        current.append(char)
+        started = True
+    if quote:
+        # An unterminated quote is a typo, not a path.
+        return None
+    if started or current:
+        tokens.append("".join(current))
+    return tokens
 
 
 class FileBrowserPanel(Gtk.Box):
@@ -46,6 +197,7 @@ class FileBrowserPanel(Gtk.Box):
         self._notify = notify or (lambda *_args, **_kwargs: None)
         self.directory = ""
         self.following = True
+        self._previous_directory = ""
         self.show_hidden = bool(config.get("filebrowser.show_hidden"))
         self._icon_cache = {}
         self._up_row: Optional[Gtk.TreeIter] = None
@@ -169,7 +321,150 @@ class FileBrowserPanel(Gtk.Box):
         footer.pack_start(self._summary, True, True, 0)
         self.pack_start(footer, False, False, 0)
 
+        self._build_command_bar()
         self._sync_toolbar()
+
+    def _build_command_bar(self) -> None:
+        """A one-line ``cd`` prompt under the listing.
+
+        This is a directory jump box, not a shell: it understands ``cd`` and
+        nothing else, and it never touches the terminal.  Running arbitrary
+        commands here would mean either hijacking the terminal (surprising, and
+        it fights with whatever the user is doing there) or keeping a hidden
+        shell alive for no benefit.  Anything beyond navigation belongs in the
+        terminal itself.
+        """
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        bar.set_border_width(4)
+        bar.get_style_context().add_class("vela-command-bar")
+
+        prompt = Gtk.Label(label="$")
+        prompt.get_style_context().add_class("vela-command-prompt")
+        bar.pack_start(prompt, False, False, 0)
+
+        self.command_entry = Gtk.Entry()
+        self.command_entry.set_placeholder_text("输入路径或 cd 进入目录")
+        self.command_entry.set_has_frame(False)
+        self.command_entry.get_style_context().add_class("vela-command-entry")
+        self.command_entry.connect("activate", self._on_command_activate)
+        self.command_entry.connect("key-press-event", self._on_command_key)
+        bar.pack_start(self.command_entry, True, True, 0)
+
+        run_button = self._tool_button(
+            "system-run-symbolic", "执行命令", self.run_command
+        )
+        bar.pack_end(run_button, False, False, 0)
+        self.pack_start(bar, False, False, 0)
+        self._command_history: List[str] = []
+        self._history_index: Optional[int] = None
+
+    # ------------------------------------------------------------------
+    # command bar
+    # ------------------------------------------------------------------
+    def focus_command_bar(self) -> None:
+        self.command_entry.grab_focus()
+
+    def run_command(self) -> None:
+        """Interpret the entry as a directory to go to."""
+        text = self.command_entry.get_text().strip()
+        if not text:
+            return
+        target = parse_cd(text)
+        if target is None:
+            self._notify("这里只支持 cd 到目录，例如：cd ~/project", 4, "warning")
+            return
+        path = self._resolve(target)
+        if path is None:
+            return
+        self._command_history.append(text)
+        self._history_index = None
+        self.command_entry.set_text("")
+        # Going somewhere is an instruction for this panel, so it stops
+        # following the terminal — same as clicking a directory in the list.
+        self.navigate(path)
+
+    def _resolve(self, target: str) -> Optional[str]:
+        """Turn a user-typed path into an absolute directory, or explain why not."""
+        if target == _CD_BACK:
+            previous = self._previous_directory
+            if not previous or not os.path.isdir(previous):
+                self._notify("没有上一个目录可返回", 4, "warning")
+                return None
+            return previous
+        expanded = os.path.expanduser(os.path.expandvars(target))
+        if not os.path.isabs(expanded):
+            base = self.directory or os.path.expanduser("~")
+            expanded = os.path.join(base, expanded)
+        path = os.path.normpath(expanded)
+        if not os.path.exists(path):
+            self._notify(f"目录不存在：{path}", 4, "warning")
+            return None
+        if not os.path.isdir(path):
+            self._notify(f"不是目录：{path}", 4, "warning")
+            return None
+        return path
+
+    def _on_command_activate(self, _entry) -> None:
+        self.run_command()
+
+    def _on_command_key(self, _widget, event) -> bool:
+        """Up/Down walk the command history; Tab completes a directory name."""
+        if event.keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+            self.complete_command()
+            return True
+        if event.keyval not in (Gdk.KEY_Up, Gdk.KEY_Down):
+            return False
+        if not self._command_history:
+            return True
+        if event.keyval == Gdk.KEY_Up:
+            if self._history_index is None:
+                self._history_index = len(self._command_history) - 1
+            else:
+                self._history_index = max(0, self._history_index - 1)
+        else:
+            if self._history_index is None:
+                return True
+            self._history_index += 1
+            if self._history_index >= len(self._command_history):
+                self._history_index = None
+                self.command_entry.set_text("")
+                return True
+        self.command_entry.set_text(self._command_history[self._history_index])
+        self.command_entry.set_position(-1)
+        return True
+
+    def complete_command(self) -> None:
+        """Complete the directory name under the cursor.
+
+        One match completes it and appends ``/`` so the next Tab descends; several
+        matches extend to their common prefix, and when even that adds nothing the
+        candidates are listed so the user can pick.
+        """
+        text = self.command_entry.get_text()
+        prefix, base, fragment = split_for_completion(text)
+        if prefix and not text.startswith(prefix):
+            # Tab right after "cd" must at least add the separating space, even
+            # when the candidates are ambiguous.
+            self.command_entry.set_text(prefix)
+            self.command_entry.set_position(-1)
+        candidates = completion_candidates(base, fragment, self.directory)
+        if not candidates:
+            self._notify("没有匹配的目录", 3)
+            return
+        if len(candidates) == 1:
+            self._set_completed(prefix, base, candidates[0] + "/")
+            return
+        common = _common_prefix(candidates)
+        if len(common) > len(fragment):
+            self._set_completed(prefix, base, common)
+            return
+        self._notify("  ".join(candidates[:12]) + ("…" if len(candidates) > 12 else ""), 6)
+
+    def _set_completed(self, prefix: str, base: str, name: str) -> None:
+        """Put a completed name back into the entry and park the cursor at the end."""
+        text = prefix + base + name
+        self.command_entry.set_text(text)
+        self.command_entry.set_position(-1)
 
     def _tool_button(self, icon: str, tooltip: str, callback: Callable) -> Gtk.Button:
         button = Gtk.Button()
@@ -200,6 +495,8 @@ class FileBrowserPanel(Gtk.Box):
 
     def navigate(self, path: str) -> bool:
         """User-initiated navigation: stops following the terminal."""
+        if self.directory and os.path.abspath(path) != os.path.abspath(self.directory):
+            self._previous_directory = self.directory
         self.following = False
         self._sync_toolbar()
         return self._load(path)
@@ -217,6 +514,9 @@ class FileBrowserPanel(Gtk.Box):
     def toggle_follow(self) -> None:
         self.following = not self.following
         self._sync_toolbar()
+        notifier = getattr(self, "on_follow_changed", None)
+        if notifier is not None:
+            notifier()
         if self.following:
             self._notify("文件面板已跟随终端目录", 3)
             directory = self._terminal_directory()

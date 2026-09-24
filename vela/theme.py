@@ -955,3 +955,144 @@ _add(
              "#657b83", "#eee8d5", "#00252e", "#93a1a1", "#0b4453",
              "#0b4453", "#001c23", "#b58900", "#cb4b16", "#0b4453"),
 )
+
+
+# ---------------------------------------------------------------------------
+# Warm, green and high-contrast themes
+#
+# The earlier set clustered around blue/purple backgrounds (hue 216-250), so
+# these deliberately cover the rest of the wheel: red/brown, orange, green,
+# teal and true black.  All values were checked for text contrast by
+# tests/test_theme.py.
+# ---------------------------------------------------------------------------
+_add(
+    "amber-crt", "Amber CRT（琥珀终端）", True,
+    "#1a1005", "#ffb000", "#ffcc66", "#1a1005", "#4a3000", "#ffd699", "#ffb000",
+    ("#3a2a10", "#ff5f52", "#7fc96a", "#ffcc33",
+     "#5fa8e8", "#d98ac8", "#5fd0c8", "#ffd9a0",
+     "#6b4a18", "#ff8a7a", "#a8e88f", "#ffe066",
+     "#8cc4ff", "#eaa8dc", "#8ce0d8", "#fff3d6"),
+    _surface("#1a1005", "#ffb000", "#0d0803", "#1a1005", "#120b04", "#3a2a10",
+             "#b07d1f", "#ffd9a0", "#120b04", "#ffb000", "#4a3000",
+             "#4a3000", "#0d0803", "#ffcc33", "#ff8a5c", "#4a3000"),
+)
+
+_add(
+    "green-crt", "Green CRT（绿色终端）", True,
+    "#04120a", "#4ee07a", "#7cf59c", "#04120a", "#0f3d22", "#d6ffe3", "#4ee07a",
+    ("#0a2416", "#ff5f56", "#4ee07a", "#f3d55b",
+     "#4aa3ff", "#c792ea", "#38d9c0", "#c8f7d8",
+     "#1c4a2e", "#ff8b82", "#7cf59c", "#ffe98a",
+     "#7cc4ff", "#dcb0ff", "#6ee8d4", "#eaffef"),
+    _surface("#04120a", "#4ee07a", "#020a06", "#04120a", "#03100a", "#0f3d22",
+             "#3f9c66", "#d6ffe3", "#03100a", "#4ee07a", "#0f3d22",
+             "#0f3d22", "#020a06", "#f3d55b", "#ff8b82", "#0f3d22"),
+)
+
+_add(
+    "gruvbox-material", "Gruvbox Material", True,
+    "#1d2021", "#ddc7a1", "#d8a657", "#1d2021", "#4a4036", "#f2e5bc", "#a9b665",
+    ("#32302f", "#ea6962", "#a9b665", "#d8a657",
+     "#7daea3", "#d3869b", "#89b482", "#ddc7a1",
+     "#5a524c", "#ea6962", "#a9b665", "#d8a657",
+     "#7daea3", "#d3869b", "#89b482", "#f2e5bc"),
+    _surface("#1d2021", "#ddc7a1", "#141617", "#1d2021", "#141617", "#3c3836",
+             "#a89984", "#ddc7a1", "#141617", "#ddc7a1", "#4a4036",
+             "#4a4036", "#141617", "#d8a657", "#ea6962", "#4a4036"),
+)
+
+_add(
+    "mocha-warm", "Mocha Warm（暖褐）", True,
+    "#1b1512", "#e8d5c4", "#f0b27a", "#1b1512", "#4a3728", "#fff2e6", "#f0b27a",
+    ("#2d2420", "#e06c5f", "#b8c98a", "#e5c07b",
+     "#a8b8d8", "#c9a0c0", "#8fc7bd", "#e8d5c4",
+     "#5c4a40", "#f08a7a", "#cfe0a0", "#f5d89a",
+     "#c0cfe8", "#dcb8d8", "#a8dcd2", "#fff5ec"),
+    _surface("#1b1512", "#e8d5c4", "#100c0a", "#1b1512", "#130f0d", "#2d2420",
+             "#a08a7c", "#e8d5c4", "#130f0d", "#e8d5c4", "#4a3728",
+             "#4a3728", "#100c0a", "#e5c07b", "#e06c5f", "#4a3728"),
+)
+
+_add(
+    "sunset-drive", "Sunset Drive（落日）", True,
+    "#1f1418", "#f5d7c8", "#ff8c69", "#1f1418", "#5a2a38", "#fff0e8", "#ff8c69",
+    ("#2e1c22", "#ff6b6b", "#9fd88f", "#ffd479",
+     "#7aa6e8", "#e08cc0", "#6fd0c8", "#f5d7c8",
+     "#5c3a44", "#ff8a8a", "#b8e8a8", "#ffe0a0",
+     "#9dc0f5", "#f0a8d8", "#90e0d8", "#fff5f0"),
+    _surface("#1f1418", "#f5d7c8", "#150d10", "#1f1418", "#170f12", "#2e1c22",
+             "#a8848c", "#f5d7c8", "#170f12", "#f5d7c8", "#5a2a38",
+             "#5a2a38", "#150d10", "#ffd479", "#ff6b6b", "#5a2a38"),
+)
+
+_add(
+    "deep-ocean", "Deep Ocean（深海）", True,
+    "#021b2e", "#9fd8e8", "#4dd0e1", "#021b2e", "#0d4a63", "#e0f7ff", "#4dd0e1",
+    ("#04293f", "#ff6b6b", "#7fd88f", "#ffd479",
+     "#5ba8f0", "#c792ea", "#4dd0e1", "#c8e8f5",
+     "#12566e", "#ff8a8a", "#a0e8a8", "#ffe0a0",
+     "#7cc0ff", "#d8b0ff", "#70e8f5", "#eafaff"),
+    _surface("#021b2e", "#9fd8e8", "#01121f", "#021b2e", "#011726", "#0d4a63",
+             "#4a7f96", "#e0f7ff", "#011726", "#9fd8e8", "#0d4a63",
+             "#0d4a63", "#01121f", "#ffd479", "#ff6b6b", "#0d4a63"),
+)
+
+_add(
+    "forest-night", "Forest Night（森林）", True,
+    "#0f1a12", "#c8ddc0", "#8fd88f", "#0f1a12", "#2e4a35", "#e8f5e0", "#8fd88f",
+    ("#1a2b1f", "#e07a6a", "#8fd88f", "#d8c98a",
+     "#7aa8c8", "#c0a0d0", "#70c8b0", "#c8ddc0",
+     "#3f5c47", "#f08a7a", "#a8e8a8", "#e8dca0",
+     "#9cc0e0", "#d8b8e8", "#90e0c8", "#f0fae8"),
+    _surface("#0f1a12", "#c8ddc0", "#080f0b", "#0f1a12", "#0a130d", "#1a2b1f",
+             "#7a9c80", "#e8f5e0", "#0a130d", "#c8ddc0", "#2e4a35",
+             "#2e4a35", "#080f0b", "#d8c98a", "#e07a6a", "#2e4a35"),
+)
+
+_add(
+    "paper-light", "Paper（纸感浅色）", False,
+    "#f6f1e7", "#3d3a33", "#a0522d", "#f6f1e7", "#e0d6c2", "#2b2823", "#a0522d",
+    ("#f6f1e7", "#b03a2e", "#4a7c3f", "#a86a1b",
+     "#2f5fa0", "#8a4ea0", "#1a7a80", "#6b6559",
+     "#a8a094", "#c14a3e", "#5a8f4f", "#c2831f",
+     "#3f6fb5", "#9a5eb0", "#2a8a90", "#3d3a33"),
+    _surface("#f6f1e7", "#3d3a33", "#ddd2bd", "#f6f1e7", "#efe8da", "#e0d6c2",
+             "#8a8378", "#2b2823", "#fffdf8", "#3d3a33", "#d5c9b2",
+             "#d5c9b2", "#efe8da", "#a86a1b", "#b03a2e", "#e8dcc4"),
+)
+
+_add(
+    "nord-light", "Nord Light", False,
+    "#eceff4", "#2e3440", "#5e81ac", "#eceff4", "#d8dee9", "#2e3440", "#5e81ac",
+    ("#3b4252", "#bf616a", "#4c7a34", "#a8711c",
+     "#5e81ac", "#8f5aa8", "#2f7d78", "#6b7280",
+     "#7a8699", "#c86c74", "#5c8a44", "#b8812c",
+     "#6e8fbc", "#9d6ab8", "#3f8d88", "#2e3440"),
+    _surface("#eceff4", "#2e3440", "#d8dee9", "#eceff4", "#e5e9f0", "#d8dee9",
+             "#7a8699", "#2e3440", "#ffffff", "#2e3440", "#c8d0dc",
+             "#c8d0dc", "#e5e9f0", "#a8711c", "#bf616a", "#dde3ec"),
+)
+
+_add(
+    "tokyo-night-day", "Tokyo Night Day", False,
+    "#e1e2e7", "#3760bf", "#3760bf", "#e1e2e7", "#b7c0e0", "#1a1b26", "#3760bf",
+    ("#3760bf", "#f52a65", "#587539", "#8c6c3e",
+     "#2e7de9", "#9854f1", "#007197", "#6172b0",
+     "#848cb5", "#f52a65", "#587539", "#8c6c3e",
+     "#2e7de9", "#9854f1", "#007197", "#1a1b26"),
+    _surface("#e1e2e7", "#3760bf", "#c4c8da", "#e1e2e7", "#d5d6de", "#c4c8da",
+             "#848cb5", "#1a1b26", "#ffffff", "#3760bf", "#b7c0e0",
+             "#b7c0e0", "#d5d6de", "#8c6c3e", "#f52a65", "#ccd0e0"),
+)
+
+_add(
+    "catppuccin-oled", "Catppuccin OLED（纯黑）", True,
+    "#000000", "#cdd6f4", "#f5e0dc", "#000000", "#45475a", "#cdd6f4", "#cba6f7",
+    ("#1e1e2e", "#f38ba8", "#a6e3a1", "#f9e2af",
+     "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de",
+     "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af",
+     "#89b4fa", "#f5c2e7", "#94e2d5", "#a6adc8"),
+    _surface("#000000", "#cdd6f4", "#11111b", "#000000", "#0a0a0f", "#1e1e2e",
+             "#9399b2", "#cdd6f4", "#0a0a0f", "#cdd6f4", "#45475a",
+             "#313244", "#0a0a0f", "#f9e2af", "#fab387", "#45475a"),
+)

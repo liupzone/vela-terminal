@@ -15,6 +15,8 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 from . import keymap, style, theme as theme_mod  # noqa: E402
 from . import files as files_mod  # noqa: E402
 from . import filebrowser as filebrowser_mod  # noqa: E402
+from . import layout as layout_mod  # noqa: E402
+from . import panels as panels_mod  # noqa: E402
 from . import sysinfo as sysinfo_mod  # noqa: E402
 from . import viewer as viewer_mod  # noqa: E402
 from .palette import CommandPalette  # noqa: E402
@@ -43,10 +45,10 @@ class MainWindow(Gtk.ApplicationWindow):
         # the notebook's page-removed handler does not queue a replacement tab.
         self._suppress_placeholder = False
         self._is_fullscreen = False
-        self.sysinfo_panel: Optional[sysinfo_mod.SysinfoPanel] = None
-        self.filebrowser_panel: Optional[filebrowser_mod.FileBrowserPanel] = None
+        # Panels are created per pane, so there is no single shared instance.
         self.sidebar_visible = False
         self._action_callbacks: Dict[str, Callable] = {}
+        self._directory_poll = 0
 
         self.get_style_context().add_class("vela")
         self.set_default_size(
@@ -66,12 +68,6 @@ class MainWindow(Gtk.ApplicationWindow):
         # allocates page children once it is itself allocated, so the window must
         # be realized after the first tab exists (see VelaApplication._launch).
         self.apply_window_options()
-        if self.sysinfo_panel is not None:
-            self.set_sysinfo_visible(
-                bool(self.config.get("sysinfo.enabled")), persist=False
-            )
-        if self.config.get("filebrowser.enabled"):
-            self.set_filebrowser_visible(True, persist=False)
 
     # ------------------------------------------------------------------
     # construction
@@ -140,9 +136,15 @@ class MainWindow(Gtk.ApplicationWindow):
         return button
 
     # ------------------------------------------------------------------
-    # sysinfo panel
+    # side panels (as split panes)
     # ------------------------------------------------------------------
-    def _create_sysinfo_panel(self) -> sysinfo_mod.SysinfoPanel:
+    def create_sysinfo_panel(self) -> sysinfo_mod.SysinfoPanel:
+        """Build a system-monitor panel for a pane.
+
+        Panels are created per pane rather than shared, so the same panel can
+        appear in several splits at once.  Each one starts sampling when its pane
+        is created and stops when the pane is closed.
+        """
         panel = sysinfo_mod.SysinfoPanel(
             self.config,
             self.theme,
@@ -150,14 +152,30 @@ class MainWindow(Gtk.ApplicationWindow):
             notify=self.show_status,
         )
         panel.on_snapshot = self._on_sysinfo_snapshot
-        # Width is owned by the side stack (both panels share one column), so the
-        # panel itself only asks for a sensible minimum.
         panel.set_size_request(200, -1)
-        self.sysinfo_panel = panel
         return panel
 
+    def start_sysinfo_pane(self) -> None:
+        """Sampling hook used by PanelView for a system-monitor pane."""
+        tab = self.active_tab
+        if tab is None:
+            return
+        view = tab.active_view
+        panel = getattr(view, "panel", None)
+        if isinstance(panel, sysinfo_mod.SysinfoPanel):
+            panel.start()
+
+    def stop_sysinfo_pane(self) -> None:
+        tab = self.active_tab
+        if tab is None:
+            return
+        view = tab.active_view
+        panel = getattr(view, "panel", None)
+        if isinstance(panel, sysinfo_mod.SysinfoPanel):
+            panel.stop()
+
     def _on_sysinfo_snapshot(self, snapshot) -> None:
-        """Mirror the panel's own reading into the status bar."""
+        """Mirror a panel's reading into the status bar."""
         if not self.config.get("sysinfo.show_in_statusbar"):
             self.status_sysinfo.set_text("")
             return
@@ -170,42 +188,12 @@ class MainWindow(Gtk.ApplicationWindow):
         if tab is None:
             return []
         rows: List[Tuple[str, int]] = []
-        for view in tab.views():
+        for view in tab.terminals():
             if view.child_pid and not view.exited:
                 rows.append((view.title, view.child_pid))
         return rows
 
-    def set_sysinfo_visible(self, visible: bool, persist: bool = True) -> None:
-        if visible and self.sysinfo_panel is None:
-            self._create_sysinfo_panel()
-        panel = self.sysinfo_panel
-        if panel is None:
-            return
-        if visible:
-            self._mount_panel(panel)
-            panel.show_all()
-            panel.start()
-        else:
-            panel.stop()
-            panel.hide()
-            self._unmount_panel(panel)
-        if hasattr(self, "sysinfo_button"):
-            # Visual state for the header button; Gtk.Button has no "active".
-            context = self.sysinfo_button.get_style_context()
-            if visible:
-                context.add_class("vela-active-toggle")
-            else:
-                context.remove_class("vela-active-toggle")
-        self.config.set("sysinfo.enabled", visible)
-        if persist:
-            self._save_config()
-        self._sync_sidebar()
-        self.update_statusbar()
-
-    # ------------------------------------------------------------------
-    # file browser panel
-    # ------------------------------------------------------------------
-    def _create_filebrowser_panel(self) -> "filebrowser_mod.FileBrowserPanel":
+    def create_filebrowser_panel(self) -> "filebrowser_mod.FileBrowserPanel":
         panel = filebrowser_mod.FileBrowserPanel(
             self.config,
             self.theme,
@@ -215,132 +203,184 @@ class MainWindow(Gtk.ApplicationWindow):
         # The panel asks for the terminal's directory whenever it needs it, so
         # following stays correct even after switching tabs.
         panel.terminal_directory = self._terminal_directory
+        panel.on_follow_changed = self._sync_follow_poll
         panel.following = bool(self.config.get("filebrowser.follow_terminal"))
         panel.set_size_request(200, -1)
-        self.filebrowser_panel = panel
+        directory = self._terminal_directory()
+        if directory:
+            panel.set_directory(directory, force=not panel.following)
+        if not panel.directory:
+            panel.navigate(os.path.expanduser("~"))
+        self._sync_follow_poll()
         return panel
 
     def _terminal_directory(self) -> str:
-        view = self.active_view
+        tab = self.active_tab
+        view = tab.active_terminal() if tab is not None else None
         if view is None:
             return ""
-        return view.directory or os.path.expanduser("~")
+        # Sampling /proc keeps this correct even when the shell never reports a
+        # directory to VTE (see TerminalView.refresh_directory).
+        refresher = getattr(view, "refresh_directory", None)
+        directory = refresher() if refresher is not None else view.directory
+        return directory or os.path.expanduser("~")
 
-    def set_filebrowser_visible(self, visible: bool, persist: bool = True) -> None:
-        if visible and self.filebrowser_panel is None:
-            self._create_filebrowser_panel()
-        panel = self.filebrowser_panel
-        if panel is None:
-            return
-        if visible:
-            self._mount_panel(panel)
-            panel.show_all()
-            panel._sync_toolbar()
-            directory = self._terminal_directory()
-            if directory:
-                panel.set_directory(directory, force=not panel.following)
-            if not panel.directory:
-                panel.navigate(os.path.expanduser("~"))
-        else:
-            panel.hide()
-            self._unmount_panel(panel)
-        if hasattr(self, "filebrowser_button"):
-            context = self.filebrowser_button.get_style_context()
-            if visible:
-                context.add_class("vela-active-toggle")
-            else:
-                context.remove_class("vela-active-toggle")
-        self.config.set("filebrowser.enabled", visible)
-        if persist:
-            self._save_config()
-        self._sync_sidebar()
-        self.update_statusbar()
+    def current_directory(self) -> Optional[str]:
+        """Directory a new terminal pane should start in."""
+        directory = self._terminal_directory()
+        if directory and os.path.isdir(directory):
+            return directory
+        return None
 
-    def toggle_filebrowser(self) -> None:
-        visible = self._filebrowser_visible()
-        self.set_filebrowser_visible(not visible)
-        self.show_status("文件面板已" + ("关闭" if visible else "打开"), 2)
-
-    def _filebrowser_visible(self) -> bool:
-        return bool(
-            self.filebrowser_panel is not None and self.filebrowser_panel.get_visible()
-        )
-
-    def _mount_panel(self, panel: Gtk.Widget) -> None:
-        """Attach a side panel to the vertical stack, once.
-
-        The file browser goes on top and the system monitor below it, matching
-        how the two are used together: the file list is scanned from the top
-        while the live counters can be left running underneath.
-        """
-        if panel.get_parent() is not None:
-            return
-        if panel is self.filebrowser_panel:
-            if self.side_paned.get_child1() is None:
-                self.side_paned.pack1(panel, True, False)
-            else:
-                # The monitor was mounted first; keep the browser on top.
-                self.side_paned.pack1(panel, True, False)
-                monitor = self.side_paned.get_child2()
-                if monitor is not None:
-                    self.side_paned.remove(monitor)
-                    self.side_paned.pack2(monitor, True, False)
-        else:
-            if self.side_paned.get_child2() is None:
-                self.side_paned.pack2(panel, True, False)
-            else:
-                self.side_paned.pack2(panel, True, False)
-
-    def _unmount_panel(self, panel: Gtk.Widget) -> None:
-        """Detach a panel and give its space back to the one that remains."""
-        parent = panel.get_parent()
-        if parent is None:
-            return
-        parent.remove(panel)
-        # GtkPaned hands the whole area to the surviving child once one slot is
-        # empty, so no divider arithmetic is needed here.
-
-    def _panels_visible(self) -> List[Gtk.Widget]:
+    def _panes_of_kind(self, kind: str) -> List:
+        tab = self.active_tab
+        if tab is None:
+            return []
         return [
-            panel
-            for panel in (self.filebrowser_panel, self.sysinfo_panel)
-            if panel is not None and panel.get_visible()
+            leaf
+            for leaf in tab.container.leaves()
+            if getattr(leaf, "kind", panels_mod.KIND_TERMINAL) == kind
         ]
 
-    def _sync_sidebar(self) -> None:
-        """Show the side stack only when at least one panel is visible."""
-        visible = self._panels_visible()
-        self.sidebar_visible = bool(visible)
-        if not visible:
-            self.side_paned.set_visible(False)
+    def split_pane_as(self, kind: str, orientation: Optional[Gtk.Orientation] = None) -> None:
+        """Split the active pane, putting ``kind`` in the new half."""
+        tab = self.active_tab
+        if tab is None:
             return
-        self.side_paned.set_visible(True)
-        # apply_window_options() runs before any panel is mounted, so the width
-        # has to be (re)applied here as well.
-        self.side_paned.set_size_request(
-            int(self.config.get("window.sidebar_width")), -1
-        )
-        self.side_paned.show_all()
-        # With both panels open, split the height evenly the first time so
-        # neither starts at a useless sliver; afterwards the user's drag wins.
-        if len(visible) == 2 and not getattr(self, "_side_split_placed", False):
-            GLib.idle_add(self._place_side_divider)
-
-    def _place_side_divider(self) -> bool:
-        height = self.side_paned.get_allocated_height()
-        if height > 120:
-            self.side_paned.set_position(height // 2)
-            self._side_split_placed = True
-        return False
+        if orientation is None:
+            orientation = Gtk.Orientation.HORIZONTAL
+        leaf = tab.split(orientation, cwd=self.current_directory(), kind=kind)
+        if leaf is None:
+            return
+        self.update_statusbar()
+        self.refresh_window_title()
+        # A new file panel is only in the tree now, so the follow poll has to be
+        # reconsidered after the split rather than while the panel is built.
+        self._sync_follow_poll()
+        self.show_status(f"已新建{panels_mod.kind_label(kind)}分屏", 2)
 
     def toggle_sysinfo(self) -> None:
-        panel = self.sysinfo_panel
-        visible = bool(panel is not None and panel.get_visible())
-        self.set_sysinfo_visible(not visible)
-        self.show_status("系统性能面板已" + ("关闭" if visible else "打开"), 2)
+        """Add or remove a system-monitor pane in the current tab."""
+        tab = self.active_tab
+        if tab is None:
+            return
+        existing = self._panes_of_kind(panels_mod.KIND_SYSINFO)
+        if existing:
+            for leaf in existing:
+                self._close_pane_leaf(leaf)
+            self.show_status("系统性能分屏已关闭", 2)
+            return
+        self.split_pane_as(panels_mod.KIND_SYSINFO)
+
+    def toggle_filebrowser(self) -> None:
+        tab = self.active_tab
+        if tab is None:
+            return
+        existing = self._panes_of_kind(panels_mod.KIND_FILEBROWSER)
+        if existing:
+            for leaf in existing:
+                self._close_pane_leaf(leaf)
+            self.show_status("文件分屏已关闭", 2)
+            return
+        self.split_pane_as(panels_mod.KIND_FILEBROWSER)
+
+    def _close_pane_leaf(self, leaf) -> None:
+        tab = self.active_tab
+        if tab is None:
+            return
+        view = leaf.view
+        terminator = getattr(view, "terminate", None)
+        if terminator is not None:
+            terminator()
+        if tab.container.count() <= 1:
+            return
+        tab.container.close(leaf)
+        tab.refresh_title()
+        self.update_statusbar()
+        self.refresh_window_title()
+        self._sync_follow_poll()
 
     def _sysinfo_visible(self) -> bool:
-        return bool(self.sysinfo_panel is not None and self.sysinfo_panel.get_visible())
+        return bool(self._panes_of_kind(panels_mod.KIND_SYSINFO))
+
+    def _filebrowser_visible(self) -> bool:
+        return bool(self._panes_of_kind(panels_mod.KIND_FILEBROWSER))
+
+    def switch_active_pane_kind(self, kind: str) -> None:
+        """Change what the active split shows, keeping its position.
+
+        Switching the last terminal away would leave a tab with no way to type,
+        so a terminal pane is opened alongside it first.
+        """
+        tab = self.active_tab
+        if tab is None:
+            return
+        was_last_terminal = (
+            not panels_mod.is_terminal(kind)
+            and len(tab.terminals()) <= 1
+            and panels_mod.is_terminal(
+                getattr(tab.container.active, "kind", panels_mod.KIND_TERMINAL)
+            )
+        )
+        original = tab.container.active
+        if was_last_terminal:
+            # Open the replacement terminal in the *new* half, so the pane the
+            # user is looking at keeps its position and the terminal appears
+            # beside it ("panel | terminal" when the panel was on the left).
+            tab.split(
+                Gtk.Orientation.HORIZONTAL,
+                cwd=self.current_directory(),
+                kind=panels_mod.KIND_TERMINAL,
+            )
+            # Switch the pane the user started from, not the new terminal.
+            tab.container.set_active(original)
+        leaf = tab.replace_active_kind(kind)
+        if leaf is None:
+            self.show_status("没有可切换的分屏", 4, "warning")
+            return
+        self.update_statusbar()
+        self.refresh_window_title()
+        message = f"当前分屏已切换为{panels_mod.kind_label(kind)}"
+        if was_last_terminal:
+            message += "（已保留一个终端分屏）"
+        self.show_status(message, 3)
+
+    def _sync_sidebar(self) -> None:
+        """Kept for compatibility; panels are panes now, not a sidebar."""
+        self.sidebar_visible = self._sysinfo_visible() or self._filebrowser_visible()
+        self.update_statusbar()
+
+    def set_sysinfo_visible(self, visible: bool, persist: bool = True) -> None:
+        """Compatibility wrapper: add or remove a monitor pane."""
+        tab = self.active_tab
+        if tab is None:
+            return
+        existing = self._panes_of_kind(panels_mod.KIND_SYSINFO)
+        if visible and not existing:
+            self.split_pane_as(panels_mod.KIND_SYSINFO)
+        elif not visible and existing:
+            for leaf in existing:
+                self._close_pane_leaf(leaf)
+        if persist:
+            self.config.set("sysinfo.enabled", visible)
+            self._save_config()
+        self.update_statusbar()
+
+    def set_filebrowser_visible(self, visible: bool, persist: bool = True) -> None:
+        """Compatibility wrapper: add or remove a file-browser pane."""
+        tab = self.active_tab
+        if tab is None:
+            return
+        existing = self._panes_of_kind(panels_mod.KIND_FILEBROWSER)
+        if visible and not existing:
+            self.split_pane_as(panels_mod.KIND_FILEBROWSER)
+        elif not visible and existing:
+            for leaf in existing:
+                self._close_pane_leaf(leaf)
+        if persist:
+            self.config.set("filebrowser.enabled", visible)
+            self._save_config()
+        self.update_statusbar()
 
     # ------------------------------------------------------------------
     # opening files
@@ -382,7 +422,7 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def _current_path(self) -> str:
-        view = self.active_view
+        view = self.active_terminal
         if view is None:
             return ""
         try:
@@ -392,7 +432,7 @@ class MainWindow(Gtk.ApplicationWindow):
             return ""
 
     def open_selection(self) -> bool:
-        view = self.active_view
+        view = self.active_terminal
         if view is None:
             return False
         if not view.terminal.get_has_selection():
@@ -445,13 +485,36 @@ class MainWindow(Gtk.ApplicationWindow):
         file_section.append("新建标签页", "win.new-tab")
         file_section.append("新建窗口", "app.new-window")
         file_section.append("重新打开已关闭的标签页", "win.reopen-tab")
+        file_section.append("重命名标签页…", "win.rename-tab")
         menu.append_section(None, file_section)
+
+        layout_section = Gio.Menu()
+        layout_section.append("保存当前布局…", "win.save-layout")
+        layout_section.append("恢复布局…", "win.restore-layout")
+        saved = layout_mod.named_layouts(self.config)
+        if saved:
+            restore_menu = Gio.Menu()
+            for name in sorted(saved):
+                item = Gio.MenuItem.new(name, None)
+                item.set_action_and_target_value(
+                    "win.restore-layout-named", GLib.Variant.new_string(name)
+                )
+                restore_menu.append_item(item)
+            layout_section.append_submenu("恢复已保存的布局", restore_menu)
+        menu.append_section(None, layout_section)
 
         split_section = Gio.Menu()
         split_section.append("垂直分屏", "win.split-vertical")
         split_section.append("水平分屏", "win.split-horizontal")
         split_section.append("关闭当前分屏", "win.close-pane")
         split_section.append("最大化当前分屏", "win.zoom-pane")
+        panel_section = Gio.Menu()
+        panel_section.append("新建系统性能分屏", "win.split-sysinfo")
+        panel_section.append("新建文件面板分屏", "win.split-filebrowser")
+        panel_section.append("当前分屏切换为终端", "win.pane-to-terminal")
+        panel_section.append("当前分屏切换为系统性能", "win.pane-to-sysinfo")
+        panel_section.append("当前分屏切换为文件面板", "win.pane-to-filebrowser")
+        menu.append_section(None, panel_section)
         menu.append_section(None, split_section)
 
         edit_section = Gio.Menu()
@@ -506,6 +569,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.notebook.connect("switch-page", self._on_switch_page)
         self.notebook.connect("page-removed", self._on_page_removed)
         self.notebook.connect("page-reordered", lambda *_: self._persist_tab_order())
+        # Tab naming and the tab menu hang off the notebook rather than off the
+        # individual tab labels: a label is a Gtk.Box with no window of its own,
+        # so GTK never dispatches a press to it.  The notebook does get the
+        # press, with coordinates relative to itself (see _tab_at).
+        self.notebook.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.notebook.connect("button-press-event", self._on_notebook_button)
 
         self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.content.pack_start(self.notebook, True, True, 0)
@@ -533,29 +602,11 @@ class MainWindow(Gtk.ApplicationWindow):
         self.palette.set_margin_top(70)
         self.overlay.add_overlay(self.palette)
 
+        # Side panels are ordinary split panes now, so the terminal area is the
+        # whole window body and the panels live inside the notebook's pane trees.
         self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-
-        # Side panels live beside the terminal area so toggling them never
-        # touches the notebook itself (no page reparenting, no shell restarts).
-        self.side_container = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=0
-        )
-        self.side_container.pack_start(self.overlay, True, True, 0)
-
-        # The panels are stacked vertically inside a Gtk.Paned so the divider is
-        # draggable.  The paned is created here, at startup: creating one later
-        # and packing children into it leaves it at a 1px allocation on this GTK
-        # version.  It stays hidden until a panel is shown.
-        self.side_paned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
-        self.side_paned.get_style_context().add_class("vela-paned")
-        self.side_paned.set_wide_handle(False)
-        self.side_paned.set_visible(False)
-        self.side_container.pack_end(self.side_paned, False, False, 0)
-        self.body.pack_start(self.side_container, True, True, 0)
+        self.body.pack_start(self.overlay, True, True, 0)
         self.add(self.body)
-
-        if self.config.get("sysinfo.enabled"):
-            self._create_sysinfo_panel()
 
     def _build_statusbar(self) -> None:
         self.statusbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -639,6 +690,19 @@ class MainWindow(Gtk.ApplicationWindow):
             ("toggle-statusbar", lambda *_: self.toggle_statusbar()),
             ("toggle-sysinfo", lambda *_: self.toggle_sysinfo()),
             ("toggle-filebrowser", lambda *_: self.toggle_filebrowser()),
+            ("split-sysinfo", lambda *_: self.split_pane_as(
+                panels_mod.KIND_SYSINFO, Gtk.Orientation.HORIZONTAL)),
+            ("split-filebrowser", lambda *_: self.split_pane_as(
+                panels_mod.KIND_FILEBROWSER, Gtk.Orientation.HORIZONTAL)),
+            ("pane-to-terminal", lambda *_: self.switch_active_pane_kind(
+                panels_mod.KIND_TERMINAL)),
+            ("pane-to-sysinfo", lambda *_: self.switch_active_pane_kind(
+                panels_mod.KIND_SYSINFO)),
+            ("pane-to-filebrowser", lambda *_: self.switch_active_pane_kind(
+                panels_mod.KIND_FILEBROWSER)),
+            ("rename-tab", lambda *_: self.rename_tab()),
+            ("save-layout", lambda *_: self.save_layout_dialog()),
+            ("restore-layout", lambda *_: self.restore_layout_dialog()),
             ("open-path", lambda *_: self.open_path()),
             ("open-selection", lambda *_: self.open_selection()),
             ("reveal-path", lambda *_: self.reveal_path()),
@@ -650,6 +714,13 @@ class MainWindow(Gtk.ApplicationWindow):
             action.connect("activate", lambda _a, _p, cb=callback: cb())
             self.add_action(action)
             self._action_callbacks[name] = callback
+
+        named = Gio.SimpleAction.new("restore-layout-named", GLib.VariantType.new("s"))
+        named.connect(
+            "activate",
+            lambda _a, param: self.restore_layout_by_name(param.get_string()),
+        )
+        self.add_action(named)
 
         theme_action = Gio.SimpleAction.new("set-theme", GLib.VariantType.new("s"))
         theme_action.connect(
@@ -744,8 +815,19 @@ class MainWindow(Gtk.ApplicationWindow):
 
     @property
     def active_view(self):
+        """The active pane's view: a terminal or a side panel."""
         tab = self.active_tab
         return tab.active_view if tab else None
+
+    @property
+    def active_terminal(self):
+        """The terminal a terminal-only action should act on.
+
+        When a panel pane is active, terminal actions fall back to the nearest
+        terminal in the same tab instead of silently doing nothing.
+        """
+        tab = self.active_tab
+        return tab.active_terminal() if tab else None
 
     def close_tab(
         self,
@@ -870,17 +952,48 @@ class MainWindow(Gtk.ApplicationWindow):
         self.update_statusbar()
         self.refresh_window_title()
         self.follow_terminal_directory()
+        self._sync_follow_poll()
 
     def follow_terminal_directory(self) -> None:
-        """Point the file panel at the active pane's directory, if it follows."""
-        panel = self.filebrowser_panel
-        if panel is None or not panel.get_visible() or not panel.following:
-            return
+        """Point every following file panel at the active terminal's directory."""
         directory = self._terminal_directory()
         if not directory:
             return
-        if os.path.abspath(directory) != os.path.abspath(panel.directory or ""):
-            panel.set_directory(directory)
+        for leaf in self._panes_of_kind(panels_mod.KIND_FILEBROWSER):
+            panel = getattr(leaf.view, "panel", None)
+            if panel is None or not getattr(panel, "following", False):
+                continue
+            if os.path.abspath(directory) != os.path.abspath(panel.directory or ""):
+                panel.set_directory(directory)
+
+    def _sync_follow_poll(self) -> None:
+        """Poll the shell's directory only while a file panel is following it.
+
+        The directory change has to be noticed without a signal: VTE emits one
+        only when the shell runs its integration hook, and the hook is installed
+        by ``PROMPT_COMMAND``, which a non-login shell never runs (see
+        ``TerminalView.refresh_directory``).  A ``cd`` typed straight into the
+        terminal would otherwise never move the panel.
+
+        The timer exists only while a following panel is on screen, so a session
+        with no file panel pays nothing.
+        """
+        wanted = any(
+            getattr(getattr(leaf.view, "panel", None), "following", False)
+            for leaf in self._panes_of_kind(panels_mod.KIND_FILEBROWSER)
+        )
+        if wanted and not self._directory_poll:
+            self._directory_poll = GLib.timeout_add(500, self._poll_directory)
+        elif not wanted and self._directory_poll:
+            GLib.source_remove(self._directory_poll)
+            self._directory_poll = 0
+
+    def _poll_directory(self) -> bool:
+        if not self._panes_of_kind(panels_mod.KIND_FILEBROWSER):
+            self._directory_poll = 0
+            return False
+        self.follow_terminal_directory()
+        return True
 
     def update_tab_visibility(self) -> None:
         mode = self.config.get("window.show_tabbar")
@@ -888,9 +1001,298 @@ class MainWindow(Gtk.ApplicationWindow):
         show = mode == "always" or (mode == "multiple" and count > 1)
         self.notebook.set_show_tabs(show)
 
+    # ------------------------------------------------------------------
+    # layouts
+    # ------------------------------------------------------------------
+    def capture_layout(self, name: str = "") -> layout_mod.LayoutSpec:
+        """Snapshot the current tabs and pane trees."""
+        return layout_mod.LayoutSpec(
+            name=name, tabs=[tab.snapshot() for tab in self.tabs]
+        )
+
+    def apply_layout(self, spec: layout_mod.LayoutSpec) -> None:
+        """Replace the current tabs with the ones described by ``spec``."""
+        spec = layout_mod.normalize(spec)
+        moved = layout_mod.prune_missing_directories(spec)
+        for tab in list(self.tabs):
+            self._closing_ok = True
+            tab.terminate_all()
+            page = self.notebook.page_num(tab.container)
+            if page >= 0:
+                self.notebook.remove_page(page)
+            if tab in self.tabs:
+                self.tabs.remove(tab)
+        for tab_spec in spec.tabs:
+            tab = Tab(self, self.config, self.theme, notify=self.show_status)
+            page = self.notebook.append_page(tab.container, tab.label)
+            self.notebook.set_tab_reorderable(tab.container, True)
+            self.notebook.set_tab_detachable(tab.container, True)
+            self.tabs.append(tab)
+            tab.container.show_all()
+            tab.label.show_all()
+            tab.restore(tab_spec)
+            tab.refresh_title()
+            self.notebook.set_current_page(page)
+        self.notebook.show_all()
+        if not self.tabs:
+            self.new_tab()
+        self.update_tab_visibility()
+        self.update_statusbar()
+        self.refresh_window_title()
+        if moved:
+            self.show_status(
+                f"布局已恢复；{len(moved)} 个目录已不存在，改用主目录", 6, "warning"
+            )
+        else:
+            self.show_status("布局已恢复", 3)
+
+    def save_layout_dialog(self, name: str = "") -> None:
+        """Ask for a name and store the current layout under it."""
+        dialog = Gtk.Dialog(title="保存布局", transient_for=self, modal=True)
+        dialog.get_style_context().add_class("vela-dialog")
+        dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+        ok_button = dialog.add_button("保存", Gtk.ResponseType.OK)
+        ok_button.get_style_context().add_class("suggested-action")
+        entry = Gtk.Entry()
+        entry.set_text(name)
+        entry.set_placeholder_text("例如：开发、部署、日志")
+        entry.set_width_chars(24)
+        entry.connect("activate", lambda *_: dialog.response(Gtk.ResponseType.OK))
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        box.add(entry)
+        hint = Gtk.Label(
+            label=(
+                f"将保存 {len(self.tabs)} 个标签页、"
+                f"{self.capture_layout().pane_count} 个分屏的结构与目录。"
+                "终端的历史输出不会被保存。"
+            )
+        )
+        hint.set_xalign(0.0)
+        hint.set_line_wrap(True)
+        hint.get_style_context().add_class("vela-dim")
+        box.add(hint)
+        existing = sorted(layout_mod.named_layouts(self.config))
+        if existing:
+            list_hint = Gtk.Label(label="已保存：" + "、".join(existing))
+            list_hint.set_xalign(0.0)
+            list_hint.set_line_wrap(True)
+            list_hint.get_style_context().add_class("vela-dim")
+            box.add(list_hint)
+        dialog.show_all()
+        entry.grab_focus()
+        entry.select_region(0, -1)
+        response = dialog.run()
+        chosen = entry.get_text()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        self.save_layout(chosen)
+
+    def save_layout(self, name: str) -> bool:
+        spec = self.capture_layout(name)
+        try:
+            key = layout_mod.store_named_layout(self.config, spec, name)
+        except layout_mod.LayoutError as error:
+            self.show_status(str(error), 6, "error")
+            return False
+        self._save_config()
+        self.show_status(f"布局已保存为「{key}」", 4)
+        return True
+
+    def restore_layout_dialog(self) -> None:
+        """Pick a saved layout and apply it."""
+        saved = layout_mod.named_layouts(self.config)
+        if not saved:
+            self.show_status("还没有保存过布局；先用「保存当前布局」", 5, "warning")
+            return
+        dialog = Gtk.Dialog(title="恢复布局", transient_for=self, modal=True)
+        dialog.get_style_context().add_class("vela-dialog")
+        dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+        restore = dialog.add_button("恢复", Gtk.ResponseType.OK)
+        restore.get_style_context().add_class("suggested-action")
+        combo = Gtk.ComboBoxText()
+        for name in sorted(saved):
+            spec = saved[name]
+            combo.append_text(f"{name}（{len(spec.tabs)} 标签 / {spec.pane_count} 分屏）")
+        combo.set_active(0)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        box.add(combo)
+        hint = Gtk.Label(label="恢复会替换当前所有标签页。")
+        hint.set_xalign(0.0)
+        hint.get_style_context().add_class("vela-dim")
+        box.add(hint)
+        dialog.show_all()
+        response = dialog.run()
+        index = combo.get_active()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or index < 0:
+            return
+        name = sorted(saved)[index]
+        self.apply_layout(saved[name])
+
+    def restore_layout_by_name(self, name: str) -> bool:
+        """Apply a named layout; used by the command palette and the menu."""
+        saved = layout_mod.named_layouts(self.config)
+        spec = saved.get(name)
+        if spec is None:
+            self.show_status(f"找不到布局「{name}」", 5, "error")
+            return False
+        self.apply_layout(spec)
+        return True
+
+    def delete_layout(self, name: str) -> bool:
+        if layout_mod.remove_named_layout(self.config, name):
+            self._save_config()
+            self.show_status(f"布局「{name}」已删除", 3)
+            return True
+        return False
+
+    # -- session ---------------------------------------------------------
+    def save_session(self) -> bool:
+        """Persist the current layout so the next launch can restore it."""
+        if not self.config.get("behavior.restore_session"):
+            return False
+        try:
+            layout_mod.save_session(self.capture_layout("session"))
+            return True
+        except OSError as error:
+            self.show_status(f"无法保存会话：{error}", 6, "error")
+            return False
+
+    def restore_session_if_enabled(self) -> bool:
+        """Restore the previous session when the setting allows it."""
+        if not self.config.get("behavior.restore_session"):
+            return False
+        spec = layout_mod.load_session()
+        if spec is None:
+            return False
+        self.apply_layout(spec)
+        self.show_status("已恢复上次的会话", 3)
+        return True
+
+    # ------------------------------------------------------------------
+    # tab naming
+    # ------------------------------------------------------------------
+    def _tab_at(self, x: int, y: int) -> Optional[Tab]:
+        """The tab whose label is under the given notebook coordinates.
+
+        ``x``/``y`` arrive relative to the notebook, but a tab label's
+        allocation is not: GtkNotebook stores it in the coordinate space of the
+        notebook's own window, which is offset by the notebook's position.  The
+        point is therefore translated into each label's space instead of being
+        compared against ``get_allocation()`` directly.
+        """
+        if not self.notebook.get_show_tabs():
+            return None
+        for index in range(self.notebook.get_n_pages()):
+            page = self.notebook.get_nth_page(index)
+            label = self.notebook.get_tab_label(page)
+            if label is None:
+                continue
+            try:
+                point = label.translate_coordinates(self.notebook, 0, 0)
+            except (TypeError, ValueError):
+                continue
+            if point is None:
+                continue
+            left, top = point[0], point[1]
+            allocation = label.get_allocation()
+            if (
+                left <= x <= left + allocation.width
+                and top <= y <= top + allocation.height
+            ):
+                return self.tab_for_widget(page)
+        return None
+
+    def _on_notebook_button(self, _widget, event) -> bool:
+        """Double-click renames a tab; right-click opens the tab menu."""
+        tab = self._tab_at(int(event.x), int(event.y))
+        if tab is None:
+            return False
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            self.rename_tab(tab)
+            return True
+        if event.button == 3:
+            self.notebook.set_current_page(self.notebook.page_num(tab.container))
+            self._show_tab_menu(tab, event)
+            return True
+        return False
+
+    def _show_tab_menu(self, tab: Tab, event) -> None:
+        menu = Gtk.Menu()
+
+        def add(label: str, callback: Callable, sensitive: bool = True) -> None:
+            item = Gtk.MenuItem(label=label)
+            item.set_sensitive(sensitive)
+            item.connect("activate", lambda *_: callback())
+            item.show()
+            menu.append(item)
+
+        add("重命名标签页…", lambda: self.rename_tab(tab))
+        add("恢复跟随 shell 标题", lambda: self.rename_tab(tab, clear=True),
+            sensitive=tab.is_named())
+        menu.append(Gtk.SeparatorMenuItem())
+        add("新建标签页", lambda: self.new_tab())
+        add("关闭标签页", lambda: self.close_tab(tab))
+        add("重新打开已关闭的标签页", lambda: self.reopen_tab())
+        menu.append(Gtk.SeparatorMenuItem())
+        add("保存当前布局…", lambda: self.save_layout_dialog())
+        add("恢复布局…", lambda: self.restore_layout_dialog())
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def rename_tab(self, tab: Optional[Tab] = None, clear: bool = False) -> None:
+        """Ask for a tab name; an empty answer restores the shell title."""
+        tab = tab or self.active_tab
+        if tab is None:
+            return
+        if clear:
+            tab.set_name("")
+            self.show_status("标签页已恢复跟随 shell 标题", 3)
+            return
+        dialog = Gtk.Dialog(
+            title="重命名标签页", transient_for=self, modal=True
+        )
+        dialog.get_style_context().add_class("vela-dialog")
+        dialog.add_button("取消", Gtk.ResponseType.CANCEL)
+        ok_button = dialog.add_button("确定", Gtk.ResponseType.OK)
+        ok_button.get_style_context().add_class("suggested-action")
+        entry = Gtk.Entry()
+        entry.set_text(tab.title_override)
+        entry.set_placeholder_text("留空则跟随 shell 标题")
+        entry.set_width_chars(28)
+        entry.connect("activate", lambda *_: dialog.response(Gtk.ResponseType.OK))
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        box.add(entry)
+        hint = Gtk.Label(label="命名后标签页不再随 shell 标题变化。")
+        hint.set_xalign(0.0)
+        hint.get_style_context().add_class("vela-dim")
+        box.add(hint)
+        dialog.show_all()
+        entry.grab_focus()
+        entry.select_region(0, -1)
+        response = dialog.run()
+        name = entry.get_text()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        tab.set_name(name)
+        if name.strip():
+            self.show_status(f"标签页已重命名为「{name.strip()}」", 3)
+        else:
+            self.show_status("标签页已恢复跟随 shell 标题", 3)
+
     def refresh_tab_titles(self) -> None:
         for tab in self.tabs:
-            view = tab.active_view
+            # A tab is named after its terminal, never after a panel pane: making
+            # the file browser the active split must not rename the tab.
+            view = tab.active_terminal()
             if view is None:
                 continue
             if not tab.title_override:
@@ -906,8 +1308,16 @@ class MainWindow(Gtk.ApplicationWindow):
         view = tab.active_view
         title = tab.title_override or (view.title if view else "终端")
         self.headerbar.set_title(title)
-        directory = view.directory if view else ""
+        # The title follows the active pane, but the directory and pane count
+        # come from the terminal side so a panel pane still shows where it is.
+        terminal = tab.active_terminal()
+        directory = getattr(terminal, "directory", "") if terminal else ""
         subtitle = _shorten_path(directory) if directory else ""
+        if view is not None and not panels_mod.is_terminal(
+            getattr(view, "kind", panels_mod.KIND_TERMINAL)
+        ):
+            label = panels_mod.kind_label(getattr(view, "kind", ""))
+            subtitle = f"{subtitle} · {label}" if subtitle else label
         panes = tab.container.count()
         if panes > 1:
             subtitle = f"{subtitle} · {panes} 个分屏" if subtitle else f"{panes} 个分屏"
@@ -966,9 +1376,12 @@ class MainWindow(Gtk.ApplicationWindow):
     # ------------------------------------------------------------------
     # editing
     # ------------------------------------------------------------------
-    def _with_view(self, callback: Callable) -> bool:
-        view = self.active_view
+    def _with_view(self, callback: Callable, terminal_only: bool = True) -> bool:
+        """Run ``callback`` on the pane a terminal action should target."""
+        view = self.active_terminal if terminal_only else self.active_view
         if view is None:
+            if terminal_only:
+                self.show_status("当前标签页没有终端分屏", 4, "warning")
             return False
         callback(view)
         return True
@@ -1005,20 +1418,20 @@ class MainWindow(Gtk.ApplicationWindow):
         else:
             self.search_revealer.set_reveal_child(True)
             selected = ""
-            view = self.active_view
+            view = self.active_terminal
             if view is not None and view.terminal.get_has_selection():
                 selected = view.get_selected_text().strip()
             self.search_bar.open(selected if len(selected) < 120 else "")
 
     def _on_search(self, pattern: str, regex: bool, forward: bool) -> bool:
-        view = self.active_view
+        view = self.active_terminal
         if view is None:
             return False
         return view.search(pattern, regex=regex, forward=forward)
 
     def _on_search_closed(self) -> None:
         self.search_revealer.set_reveal_child(False)
-        view = self.active_view
+        view = self.active_terminal
         if view is not None:
             view.clear_search()
         if view is not None:
@@ -1027,7 +1440,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def toggle_palette(self) -> None:
         if self.palette.get_visible():
             self.palette.hide()
-            view = self.active_view
+            view = self.active_terminal
             if view is not None:
                 view.terminal.grab_focus()
             return
@@ -1076,6 +1489,14 @@ class MainWindow(Gtk.ApplicationWindow):
             ("toggle_statusbar", "显示/隐藏状态栏", hint("toggle_statusbar"), "statusbar 状态栏"),
             ("toggle_sysinfo", "系统性能面板", hint("toggle_sysinfo"), "sysinfo cpu 性能 监控 资源"),
             ("toggle_filebrowser", "文件面板", hint("toggle_filebrowser"), "files 文件 浏览 目录 folder"),
+            ("split_sysinfo", "新建系统性能分屏", "", "split sysinfo 性能 分屏"),
+            ("split_filebrowser", "新建文件面板分屏", "", "split files 文件 分屏"),
+            ("pane_to_terminal", "当前分屏切换为终端", "", "pane terminal 切换 终端"),
+            ("pane_to_sysinfo", "当前分屏切换为系统性能", "", "pane sysinfo 切换 性能"),
+            ("pane_to_filebrowser", "当前分屏切换为文件面板", "", "pane files 切换 文件"),
+            ("rename_tab", "重命名标签页", hint("rename_tab"), "rename tab 重命名 标签"),
+            ("save_layout", "保存当前布局", hint("save_layout"), "layout save 保存 布局"),
+            ("restore_layout", "恢复布局", hint("restore_layout"), "layout restore 恢复 布局"),
             ("open_path", "打开路径 / 文件", hint("open_path"), "open file 打开 文件 路径"),
             ("open_selection", "打开选中的路径", hint("open_selection"), "open selection 打开 选区"),
             ("reveal_path", "在文件管理器中显示", hint("reveal_path"), "reveal 文件管理器 显示"),
@@ -1105,10 +1526,6 @@ class MainWindow(Gtk.ApplicationWindow):
         self._refresh_css()
         for tab in self.tabs:
             tab.apply_theme(self.theme)
-        if self.sysinfo_panel is not None:
-            self.sysinfo_panel.apply_theme(self.theme)
-        if self.filebrowser_panel is not None:
-            self.filebrowser_panel.apply_theme(self.theme)
         for window in list(self._viewer_windows):
             window.apply_theme(self.theme)
         if persist:
@@ -1143,20 +1560,6 @@ class MainWindow(Gtk.ApplicationWindow):
         show_header = bool(self.config.get("window.show_headerbar"))
         self.headerbar.set_visible(show_header)
         self.statusbar.set_visible(bool(self.config.get("window.show_statusbar")))
-        if self.sysinfo_panel is not None:
-            self.sysinfo_panel.sampler.skip_loopback = bool(
-                self.config.get("sysinfo.hide_loopback")
-            )
-            interval = max(500, int(float(self.config.get("sysinfo.interval")) * 1000))
-            self.sysinfo_panel.stop()
-            if self.sysinfo_panel.get_visible():
-                self.sysinfo_panel._timer = GLib.timeout_add(
-                    interval, self.sysinfo_panel._tick
-                )
-        if self.side_paned.get_visible():
-            self.side_paned.set_size_request(
-                int(self.config.get("window.sidebar_width")), -1
-            )
         self.notebook.set_tab_pos(self._tab_position())
         self.update_tab_visibility()
         self._apply_appearance()
@@ -1229,23 +1632,49 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def update_statusbar(self) -> None:
         tab = self.active_tab
-        view = tab.active_view if tab else None
-        if view is None:
+        if tab is None:
             self.status_dir.set_text("")
             self.status_panes.set_text("")
             self.status_theme.set_text("")
             self.status_cursor.set_text("")
             self.status_sysinfo.set_text("")
             return
-        directory = view.directory or os.path.expanduser("~")
-        self.status_dir.set_text(_shorten_path(directory))
-        self.status_dir.set_tooltip_text(directory)
-        parts = [view.shell_name]
+        # The status bar describes the terminal being worked in; when a panel
+        # pane is active, the nearest terminal supplies directory and cursor.
+        view = tab.active_terminal()
+        active = tab.active_view
+        if view is None:
+            self.status_dir.set_text("")
+            self.status_cursor.set_text("")
+        else:
+            directory = view.directory or os.path.expanduser("~")
+            self.status_dir.set_text(_shorten_path(directory))
+            self.status_dir.set_tooltip_text(directory)
+            self.status_cursor.set_text(self._cursor_text(view))
+        parts: List[str] = []
+        if view is not None:
+            parts.append(view.shell_name)
+        if active is not None and not panels_mod.is_terminal(
+            getattr(active, "kind", panels_mod.KIND_TERMINAL)
+        ):
+            parts.append(panels_mod.kind_label(getattr(active, "kind", "")))
         if tab.container.count() > 1:
             parts.append(f"{tab.container.count()} 分屏")
         self.status_panes.set_text(" · ".join(parts))
         self.status_theme.set_text(theme_mod.label(str(self.config.get("appearance.theme"))))
-        self.status_cursor.set_text(self._cursor_text(view))
+        self.status_sysinfo.set_text(self._sysinfo_status_text())
+
+    def _sysinfo_status_text(self) -> str:
+        """CPU/memory summary from any live monitor pane."""
+        for leaf in self._panes_of_kind(panels_mod.KIND_SYSINFO):
+            panel = getattr(leaf.view, "panel", None)
+            snapshot = getattr(panel, "last_snapshot", None)
+            if snapshot is not None:
+                return (
+                    f"CPU {snapshot.cpu_percent:.0f}% · "
+                    f"内存 {snapshot.memory.percent:.0f}%"
+                )
+        return ""
 
     def _cursor_text(self, view) -> str:
         try:
@@ -1304,6 +1733,10 @@ class MainWindow(Gtk.ApplicationWindow):
             if response != Gtk.ResponseType.OK:
                 return True
         self._closing = True
+        if self._directory_poll:
+            GLib.source_remove(self._directory_poll)
+            self._directory_poll = 0
+        self.save_session()
         self._save_window_geometry()
         for tab in list(self.tabs):
             tab.terminate_all()

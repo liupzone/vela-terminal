@@ -139,6 +139,11 @@ class VelaApplication(Gtk.Application):
         cwd = overrides.get("cwd") or self._initial_cwd()
         argv = overrides.get("argv") or self._initial_argv()
         tab = window.new_tab(cwd=cwd, argv=argv)
+        # Restoring the previous session replaces that starter tab, so it only
+        # happens when the user has not asked for something specific on the
+        # command line.
+        if not (cwd or argv) and not overrides.get("title"):
+            window.restore_session_if_enabled()
         # Realize the window only now that it has content; see the note in
         # MainWindow.__init__.
         window.show_all()

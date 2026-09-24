@@ -132,6 +132,25 @@ def _parse_value(token: str, line_no: int) -> Any:
         if not inner:
             return []
         return [_parse_value(part, line_no) for part in _split_top_level(inner, line_no)]
+    if token.startswith("{"):
+        # Inline table, as written by _format_value for nested structures.
+        if not token.endswith("}"):
+            raise TomlError(f"unterminated inline table: {token!r}", line_no)
+        inner = token[1:-1].strip()
+        table: Dict[str, Any] = {}
+        if not inner:
+            return table
+        for part in _split_top_level(inner, line_no):
+            key, sep, value = part.partition("=")
+            if not sep:
+                raise TomlError(f"bad inline table entry: {part!r}", line_no)
+            key = key.strip()
+            if key and key[0] in "\"'":
+                key = _parse_string(key, line_no)
+            elif not _BARE_KEY.match(key):
+                raise TomlError(f"unsupported inline key: {key!r}", line_no)
+            table[key] = _parse_value(value, line_no)
+        return table
     lowered = token.lower()
     if lowered in _BOOL:
         return _BOOL[lowered]
@@ -202,6 +221,11 @@ def _format_value(value: Any) -> str:
         return f'"{escaped}"'
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_format_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        # Inline tables keep nested structures (a saved layout, for example)
+        # readable on one line and avoid generating a maze of subtables.
+        parts = [f"{key} = {_format_value(item)}" for key, item in value.items()]
+        return "{ " + ", ".join(parts) + " }"
     raise TypeError(f"cannot serialise {type(value).__name__} to TOML")
 
 
@@ -224,10 +248,22 @@ def _dump_table(data: Dict[str, Any], path: List[str], lines: List[str]) -> None
         else:
             scalars.append((key, value))
     if path and (scalars or not tables):
-        lines.append("[" + ".".join(path) + "]")
+        lines.append("[" + ".".join(_format_key(part) for part in path) + "]")
     for key, value in scalars:
-        lines.append(f"{key} = {_format_value(value)}")
+        lines.append(f"{_format_key(key)} = {_format_value(value)}")
     if path and scalars:
         lines.append("")
     for key, table in tables:
         _dump_table(table, path + [key], lines)
+
+
+def _format_key(key: str) -> str:
+    """Quote a key when it is not a bare TOML key.
+
+    Layout names are user-supplied and often Chinese, and TOML only allows
+    ASCII letters, digits, ``_`` and ``-`` in a bare key.
+    """
+    if _BARE_KEY.match(key):
+        return key
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'

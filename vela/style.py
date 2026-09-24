@@ -424,6 +424,33 @@ box.vela-filebrowser label.vela-error {{
     color: {theme.palette.get("red", accent)};
 }}
 
+box.vela-command-bar {{
+    background-color: {tab_inactive_bg};
+    border-top: 1px solid {border};
+}}
+
+box.vela-command-bar label.vela-command-prompt {{
+    color: {accent};
+    font-family: monospace;
+    font-weight: 600;
+    padding: 0 2px;
+}}
+
+box.vela-command-bar entry.vela-command-entry {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    color: {overlay_fg};
+    caret-color: {accent};
+    font-family: monospace;
+    min-height: 22px;
+}}
+
+box.vela-command-bar entry.vela-command-entry:focus {{
+    box-shadow: none;
+}}
+
 window.vela textview.vela-source,
 window.vela textview.vela-source text {{
     background-color: {theme.background};

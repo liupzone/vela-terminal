@@ -21,10 +21,16 @@ class Node:
 
 
 class Leaf(Node):
-    """A single terminal view."""
+    """One pane: a terminal, or a side panel such as the system monitor.
 
-    def __init__(self, view) -> None:
+    The tree itself is type-agnostic — it only needs a widget that understands
+    ``set_focused()`` — so a leaf records which kind of view it holds purely so
+    the window can decide whether terminal-specific actions apply.
+    """
+
+    def __init__(self, view, kind: str = "terminal") -> None:
         self.view = view
+        self.kind = kind
         self.parent: Optional[Split] = None
 
     def leaves(self) -> Iterator["Leaf"]:
@@ -64,7 +70,11 @@ class Split(Node):
 class PaneContainer(Gtk.Box):
     """Renders a pane tree and keeps the widget hierarchy in sync."""
 
-    def __init__(self, make_view: Callable[[], object], on_layout_changed=None) -> None:
+    def __init__(
+        self,
+        make_view: Callable[..., object],
+        on_layout_changed=None,
+    ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._make_view = make_view
         self._on_layout_changed = on_layout_changed or (lambda: None)
@@ -82,9 +92,9 @@ class PaneContainer(Gtk.Box):
         super().pack_start(self._zoom_host, True, True, 0)
 
     # -- construction ----------------------------------------------------
-    def bootstrap(self) -> Leaf:
+    def bootstrap(self, kind: str = "terminal") -> Leaf:
         """Create the first leaf."""
-        leaf = Leaf(self._make_view())
+        leaf = Leaf(self._make_view(kind), kind)
         self.root = leaf
         widget = self._widget_for(leaf)
         self._layout_host.pack_start(widget, True, True, 0)
@@ -99,12 +109,18 @@ class PaneContainer(Gtk.Box):
         return len(self.leaves())
 
     # -- mutation --------------------------------------------------------
-    def split(self, leaf: Leaf, orientation: Gtk.Orientation, cwd: Optional[str] = None) -> Leaf:
-        """Split ``leaf``, spawning a new terminal in the new half."""
+    def split(
+        self,
+        leaf: Leaf,
+        orientation: Gtk.Orientation,
+        cwd: Optional[str] = None,
+        kind: str = "terminal",
+    ) -> Leaf:
+        """Split ``leaf``, creating a new pane of ``kind`` in the new half."""
         if self.root is None or leaf not in self.leaves():
             raise ValueError("cannot split a leaf that is not in this container")
         self.unzoom()
-        new_leaf = Leaf(self._make_view())
+        new_leaf = Leaf(self._make_view(kind), kind)
         parent = leaf.parent
         split_node = Split(orientation, leaf, new_leaf)
         split_node.parent = parent
@@ -122,6 +138,11 @@ class PaneContainer(Gtk.Box):
         view = new_leaf.view
         if hasattr(view, "spawn"):
             view.spawn(cwd=cwd)
+        # A panel pane starts its own work (the monitor's sampling timer) only
+        # once it is on screen.
+        starter = getattr(view, "start", None)
+        if starter is not None:
+            starter()
         self._on_layout_changed()
         self.set_active(new_leaf)
         # A split created while other parts of the window are mid-layout can end
@@ -182,9 +203,98 @@ class PaneContainer(Gtk.Box):
         return self.active
 
     def replace_view(self, leaf: Leaf, view) -> None:
-        """Swap the terminal view inside a leaf (used by 'reopen closed tab')."""
+        """Swap the view inside a leaf, keeping its place in the tree.
+
+        Used by "reopen closed tab" and by switching a pane's kind.  The new
+        view is started here for the same reason ``split()`` does it: a panel
+        pane only begins its work (the monitor's sampling timer) once it is on
+        screen, and without this a pane switched to the system monitor showed
+        placeholder dashes forever.
+        """
         leaf.view = view
         self._rebuild()
+        starter = getattr(view, "start", None)
+        if starter is not None:
+            starter()
+        if self.active is leaf:
+            self.set_active(leaf, focus=False)
+
+    # -- restoring a saved layout ----------------------------------------
+    def clear(self) -> None:
+        """Tear the tree down, stopping every pane first.
+
+        Used before rebuilding from a saved layout.  Panels are stopped so a
+        discarded monitor does not keep its sampling timer alive.
+        """
+        for leaf in self.leaves():
+            terminator = getattr(leaf.view, "terminate", None)
+            if terminator is not None:
+                terminator()
+        self.root = None
+        self.active = None
+        self.zoomed = False
+        self._focused_widget = None
+        self._destroy_layout()
+        self._zoom_host.hide()
+
+    def build_from_spec(self, spec, make_view: Callable[[str], object]) -> Optional[Leaf]:
+        """Rebuild the pane tree from a saved layout spec.
+
+        ``make_view`` receives the pane kind and returns the view, so the
+        container stays unaware of terminals and panels.
+        """
+        node = self._node_from_spec(spec, make_view)
+        self.root = node
+        self._rebuild()
+        self._apply_positions(node)
+        first = self._first_leaf(node)
+        if first is not None:
+            self.set_active(first)
+        return first
+
+    def _node_from_spec(self, spec, make_view: Callable[[str], object]) -> Node:
+        """Turn a spec node into a tree of leaves, creating the views."""
+        # A spec split carries its own type; detect it structurally so pane.py
+        # does not have to import the layout module.
+        if hasattr(spec, "first") and hasattr(spec, "second"):
+            orientation = (
+                Gtk.Orientation.HORIZONTAL
+                if getattr(spec, "orientation", "h") == "h"
+                else Gtk.Orientation.VERTICAL
+            )
+            node = Split(
+                orientation,
+                self._node_from_spec(spec.first, make_view),
+                self._node_from_spec(spec.second, make_view),
+            )
+            node.position = int(getattr(spec, "position", 0) or 0)
+            node.user_adjusted = bool(node.position)
+            return node
+        kind = getattr(spec, "kind", "terminal")
+        view = make_view(kind)
+        leaf = Leaf(view, kind)
+        # A restored pane has to be brought to life here.  ``split()`` spawns the
+        # shell of a pane it creates, and that step was missing on the restore
+        # path, so every terminal came back as an empty frame with no prompt.
+        cwd = getattr(spec, "cwd", "") or ""
+        if hasattr(view, "spawn"):
+            view.spawn(cwd=cwd or None)
+        else:
+            starter = getattr(view, "start", None)
+            if starter is not None:
+                starter()
+        return leaf
+
+    def _apply_positions(self, node: Optional[Node]) -> None:
+        """Re-apply saved divider positions once the panes have a size."""
+        if node is None or isinstance(node, Leaf):
+            return
+        if node.position:
+            paned = getattr(node, "widget", None)
+            if paned is not None:
+                paned.set_position(int(node.position))
+        self._apply_positions(node.first)
+        self._apply_positions(node.second)
 
     # -- focus -----------------------------------------------------------
     def set_active(self, leaf: Optional[Leaf], focus: bool = True) -> None:
@@ -526,6 +636,7 @@ class PaneContainer(Gtk.Box):
         return False
 
     def _rebuild(self) -> None:
+        """Discard the rendered tree and rebuild it from ``self.root``."""
         # Discard every GtkPaned and build fresh ones.  This GTK version caches a
         # GtkPaned's minimum size when its children are replaced while it is on
         # screen, and the cached value is 1px, which collapsed whole splits.  A
@@ -578,18 +689,30 @@ class PaneContainer(Gtk.Box):
         Leaf nodes and get packed into fresh panes right after, so they must be
         detached before the paned goes away — re-using a destroyed widget is what
         made GTK crash inside gtk_widget_get_preferred_height().
+
+        Only the panes' own child widgets are detached, never their internals:
+        emptying a TerminalView would pull the VTE widget out of its scroller,
+        and nothing puts it back, leaving that pane permanently unrealized (it
+        rendered as an empty box and could not take keyboard focus).
         """
         for child in list(self._layout_host.get_children()):
-            self._detach_descendants(child)
+            self._detach_children(child)
             self._layout_host.remove(child)
 
-    def _detach_descendants(self, widget: Gtk.Widget) -> None:
-        """Empty every container below ``widget`` so nothing is destroyed with it."""
-        if not isinstance(widget, Gtk.Container):
+    def _detach_children(self, widget: Gtk.Widget) -> None:
+        """Remove a paned's direct children so they survive its destruction.
+
+        Panes below ``widget`` are visited, but their contents are left alone.
+        """
+        if not isinstance(widget, Gtk.Paned):
             return
-        for child in list(widget.get_children()):
-            self._detach_descendants(child)
-            widget.remove(child)
+        for slot in (widget.get_child1(), widget.get_child2()):
+            if slot is None:
+                continue
+            # Nested panes are detached the same way, but a TerminalView is a
+            # leaf: it is removed whole, keeping its scroller and VTE intact.
+            self._detach_children(slot)
+            widget.remove(slot)
 
     def _discard_widget(self, leaf: Leaf) -> None:
         widget = self._widget_for(leaf)

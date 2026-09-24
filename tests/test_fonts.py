@@ -309,6 +309,195 @@ class FontListTests(unittest.TestCase):
                 os.environ[fonts.FONT_DIR_ENV] = previous
 
 
+class LocalFontImportTests(unittest.TestCase):
+    """Importing fonts that already exist on the machine (e.g. 微软雅黑).
+
+    These are proprietary, so Vela never downloads them: the only legitimate
+    copy is the one on the user's own Windows partition.  The tests use a
+    fixture directory instead of a real mount.
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.root = self._temp.name
+        self.fonts_dir = os.path.join(self.root, "Windows", "Fonts")
+        os.makedirs(self.fonts_dir)
+        self._previous = os.environ.get(fonts.WINDOWS_FONT_DIR_ENV)
+        os.environ[fonts.WINDOWS_FONT_DIR_ENV] = self.fonts_dir
+
+    def tearDown(self):
+        if self._previous is None:
+            os.environ.pop(fonts.WINDOWS_FONT_DIR_ENV, None)
+        else:
+            os.environ[fonts.WINDOWS_FONT_DIR_ENV] = self._previous
+        self._temp.cleanup()
+
+    def write_font(self, name: str, size: int = 64) -> str:
+        path = os.path.join(self.fonts_dir, name)
+        with open(path, "wb") as handle:
+            handle.write(make_font_bytes(size))
+        return path
+
+    def test_windows_dir_is_found_via_the_override(self):
+        self.assertEqual(fonts.windows_font_dirs(), [self.fonts_dir])
+
+    def test_yahei_is_detected_when_present(self):
+        self.write_font("msyh.ttc")
+        self.write_font("msyhbd.ttc")
+        self.write_font("msyhl.ttc")
+        available = {entry.key for entry, _paths in fonts.available_local_fonts()}
+        self.assertIn("microsoft-yahei", available)
+
+    def test_all_three_yahei_weights_are_picked_up(self):
+        for name in ("msyh.ttc", "msyhbd.ttc", "msyhl.ttc"):
+            self.write_font(name)
+        entry = fonts.find_local("microsoft-yahei")
+        self.assertEqual(len(entry.resolve(self.fonts_dir)), 3)
+
+    def test_absent_font_is_not_reported(self):
+        available = {entry.key for entry, _paths in fonts.available_local_fonts()}
+        self.assertNotIn("microsoft-yahei", available)
+
+    def test_no_windows_mount_gives_empty_list(self):
+        os.environ.pop(fonts.WINDOWS_FONT_DIR_ENV, None)
+        previous_glob = fonts.glob.glob
+        try:
+            fonts.glob.glob = lambda pattern: []
+            self.assertEqual(fonts.windows_font_dirs(), [])
+        finally:
+            fonts.glob.glob = previous_glob
+        os.environ[fonts.WINDOWS_FONT_DIR_ENV] = self.fonts_dir
+
+    def test_import_copies_the_files(self):
+        for name in ("msyh.ttc", "msyhbd.ttc"):
+            self.write_font(name)
+        target = os.path.join(self.root, "target")
+        imported = fonts.import_local("microsoft-yahei", target)
+        self.assertEqual(len(imported), 2)
+        self.assertTrue(all(os.path.exists(path) for path in imported))
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(target, "microsoft-yahei"))),
+            ["msyh.ttc", "msyhbd.ttc"],
+        )
+
+    def test_import_leaves_the_source_untouched(self):
+        source = self.write_font("msyh.ttc")
+        before = os.stat(source)
+        fonts.import_local("microsoft-yahei", os.path.join(self.root, "target"))
+        self.assertTrue(os.path.exists(source), "源文件必须保留")
+        self.assertEqual(os.stat(source).st_size, before.st_size)
+
+    def test_import_is_idempotent(self):
+        """Re-importing replaces the package instead of accumulating files."""
+        first = self.write_font("msyh.ttc")
+        target = os.path.join(self.root, "target")
+        fonts.import_local("microsoft-yahei", target)
+        # Drop the first weight and import a different one: the package must
+        # contain only what the second import found.
+        os.unlink(first)
+        self.write_font("msyhbd.ttc")
+        imported = fonts.import_local("microsoft-yahei", target)
+        self.assertEqual(len(imported), 1)
+        self.assertEqual(
+            os.listdir(os.path.join(target, "microsoft-yahei")), ["msyhbd.ttc"]
+        )
+
+    def test_import_without_the_font_reports_clearly(self):
+        with self.assertRaises(fonts.DownloadError) as context:
+            fonts.import_local("microsoft-yahei", os.path.join(self.root, "target"))
+        self.assertIn("没有找到", str(context.exception))
+
+    def test_import_rejects_a_file_that_is_not_a_font(self):
+        with open(os.path.join(self.fonts_dir, "msyh.ttc"), "wb") as handle:
+            handle.write(b"<!DOCTYPE html>")
+        with self.assertRaises(fonts.DownloadError) as context:
+            fonts.import_local("microsoft-yahei", os.path.join(self.root, "target"))
+        self.assertIn("不是有效", str(context.exception))
+
+    def test_import_leaves_nothing_behind_on_a_bad_file(self):
+        with open(os.path.join(self.fonts_dir, "msyh.ttc"), "wb") as handle:
+            handle.write(b"not a font")
+        target = os.path.join(self.root, "target")
+        with self.assertRaises(fonts.DownloadError):
+            fonts.import_local("microsoft-yahei", target)
+        self.assertFalse(os.path.isdir(os.path.join(target, "microsoft-yahei")))
+
+    def test_unknown_local_key(self):
+        with self.assertRaises(fonts.DownloadError):
+            fonts.import_local("no-such-font", self.root)
+
+    def test_is_local_installed_reflects_the_target_directory(self):
+        self.write_font("msyh.ttc")
+        target = os.path.join(self.root, "target")
+        previous = os.environ.get(fonts.FONT_DIR_ENV)
+        os.environ[fonts.FONT_DIR_ENV] = target
+        try:
+            self.assertFalse(fonts.is_local_installed("microsoft-yahei"))
+            fonts.import_local("microsoft-yahei", target)
+            self.assertTrue(fonts.is_local_installed("microsoft-yahei"))
+        finally:
+            if previous is None:
+                os.environ.pop(fonts.FONT_DIR_ENV, None)
+            else:
+                os.environ[fonts.FONT_DIR_ENV] = previous
+
+    def test_local_catalog_entries_are_well_formed(self):
+        keys = [entry.key for entry in fonts.local_catalog()]
+        self.assertEqual(len(keys), len(set(keys)))
+        for entry in fonts.local_catalog():
+            with self.subTest(font=entry.key):
+                self.assertTrue(entry.name)
+                self.assertTrue(entry.description)
+                self.assertTrue(entry.patterns)
+
+    def test_yahei_is_in_the_catalog(self):
+        entry = fonts.find_local("microsoft-yahei")
+        self.assertIsNotNone(entry)
+        self.assertIn("雅黑", entry.name)
+
+    def test_proprietary_fonts_are_not_in_the_download_catalog(self):
+        """The download list must stay free of proprietary fonts."""
+        download_names = " ".join(
+            entry.name.lower() for entry in fonts.catalog()
+        )
+        for proprietary in ("yahei", "雅黑", "simsun", "宋体", "dengxian"):
+            self.assertNotIn(proprietary, download_names)
+
+
+class CjkFamilyTests(unittest.TestCase):
+    def test_cjk_list_includes_known_families(self):
+        families = fonts.cjk_families()
+        if not families:
+            self.skipTest("Pango 不可用")
+        # At least one CJK family ships with Ubuntu.
+        self.assertTrue(
+            any(
+                hint in name.lower()
+                for name in families
+                for hint in ("cjk", "yahei", "wenquanyi", "uming", "ukai")
+            ),
+            families[:10],
+        )
+
+    def test_cjk_list_is_sorted_and_unique(self):
+        families = fonts.cjk_families()
+        if not families:
+            self.skipTest("Pango 不可用")
+        self.assertEqual(families, sorted(families, key=lambda n: n.lower()))
+        self.assertEqual(len(families), len(set(families)))
+
+    def test_monospace_and_cjk_lists_are_separate_concerns(self):
+        """A proportional CJK font belongs in the fallback list, not the mono one."""
+        mono = set(fonts.monospace_families())
+        cjk = set(fonts.cjk_families())
+        # The lists overlap only where a font is both (e.g. Noto Sans Mono CJK).
+        self.assertTrue(cjk, "应当至少有一个 CJK 字体")
+        self.assertTrue(
+            cjk - mono or cjk & mono,
+            "两个列表都应可用",
+        )
+
+
 class SystemFontTests(unittest.TestCase):
     """Discovery against the real font set (needs Pango, no network)."""
 

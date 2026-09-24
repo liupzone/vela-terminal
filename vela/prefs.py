@@ -183,11 +183,13 @@ class PreferencesDialog(Gtk.Dialog):
 
         self._add_section(grid, row, "中英文混排")
         row += 1
-        fallback = Gtk.Entry()
-        fallback.set_text(str(self.config.get("appearance.fallback_font")))
-        fallback.set_placeholder_text("例如 Noto Sans Mono CJK SC")
-        fallback.connect("changed", self._on_fallback_font)
-        row = self._add_row(grid, row, "中文回退字体", fallback)
+        # A picker rather than a text field: the fallback is usually a
+        # proportional CJK font (微软雅黑, Noto Sans CJK) that is not in the
+        # monospace list, so typing the family name by hand invites typos.
+        self._cjk_combo = Gtk.ComboBoxText()
+        self._populate_cjk_families()
+        self._cjk_combo.connect("changed", self._on_cjk_changed)
+        row = self._add_row(grid, row, "中文回退字体", self._cjk_combo)
 
         hint = Gtk.Label(
             label=(
@@ -210,6 +212,39 @@ class PreferencesDialog(Gtk.Dialog):
         preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         preview_box.pack_start(self._preview, False, False, 0)
         row = self._add_row(grid, row, "", preview_box)
+
+        # Fonts already present on this machine (a mounted Windows partition).
+        # They are proprietary, so Vela never downloads them; importing copies
+        # the user's own copy without modifying the original.
+        self._add_section(grid, row, "本机已有的字体（从 Windows 分区导入）")
+        row += 1
+        local_hint = Gtk.Label(
+            label=(
+                "微软雅黑等字体属于 Windows，Vela 不会联网下载，只从你本机"
+                "已挂载的 Windows 分区复制一份到字体目录。适合作为中文回退字体。"
+            )
+        )
+        local_hint.set_xalign(0.0)
+        local_hint.set_line_wrap(True)
+        local_hint.get_style_context().add_class("vela-dim")
+        row = self._add_row(grid, row, "", local_hint)
+
+        self._local_buttons: Dict[str, Gtk.Button] = {}
+        for local in fonts_mod.local_catalog():
+            button = Gtk.Button(label=f"导入 {local.name}")
+            button.set_tooltip_text(local.description)
+            button.set_halign(Gtk.Align.START)
+            button.connect(
+                "clicked", lambda _b, key=local.key: self._import_local_font(key)
+            )
+            self._local_buttons[local.key] = button
+            row = self._add_row(grid, row, local.name, button)
+
+        self._local_status = Gtk.Label(label="")
+        self._local_status.set_xalign(0.0)
+        self._local_status.set_line_wrap(True)
+        self._local_status.get_style_context().add_class("vela-dim")
+        row = self._add_row(grid, row, "", self._local_status)
 
         self._add_section(grid, row, "下载编程字体")
         row += 1
@@ -317,6 +352,61 @@ class PreferencesDialog(Gtk.Dialog):
             f"系统检测到 {len(families)} 个等宽字体；"
             f"已从本页安装 {len(installed)} 个编程字体。"
         )
+        self._update_local_status()
+
+    def _update_local_status(self) -> None:
+        """Show which Windows fonts were found and which are already imported."""
+        available = {entry.key for entry, _paths in fonts_mod.available_local_fonts()}
+        for key, button in self._local_buttons.items():
+            entry = fonts_mod.find_local(key)
+            name = entry.name if entry else key
+            if fonts_mod.is_local_installed(key):
+                button.set_label("已导入")
+                button.set_sensitive(False)
+            elif key in available:
+                button.set_label(f"导入 {name}")
+                button.set_sensitive(True)
+            else:
+                button.set_label(f"未找到 {name}")
+                button.set_sensitive(False)
+        if not fonts_mod.windows_font_dirs():
+            self._local_status.set_text(
+                "未检测到已挂载的 Windows 分区。挂载后点「重新扫描」即可导入。"
+            )
+            return
+        imported = sum(
+            1 for entry in fonts_mod.local_catalog()
+            if fonts_mod.is_local_installed(entry.key)
+        )
+        self._local_status.set_text(
+            f"检测到 {len(available)} 种可导入字体，已导入 {imported} 种。"
+        )
+
+    def _import_local_font(self, key: str) -> None:
+        """Copy a machine-local font (e.g. 微软雅黑) into Vela's font dir."""
+        entry = fonts_mod.find_local(key)
+        if entry is None:
+            return
+        button = self._local_buttons.get(key)
+        if button is not None:
+            button.set_sensitive(False)
+            button.set_label("导入中…")
+        try:
+            paths = fonts_mod.import_local(key)
+        except fonts_mod.DownloadError as error:
+            self._local_status.set_text(f"{entry.name} 导入失败：{error}")
+            self._update_local_status()
+            self.parent_window.show_status(f"{entry.name} 导入失败：{error}", 8, "error")
+            return
+        self._local_status.set_text(
+            f"{entry.name} 已导入（{len(paths)} 个字体文件）。"
+            "建议在「中文回退字体」里填 Microsoft YaHei。"
+        )
+        # The font is available immediately; refresh the pickers so it shows up.
+        self._populate_families()
+        self._populate_cjk_families()
+        self._update_local_status()
+        self.parent_window.show_status(f"{entry.name} 已导入", 4)
 
     def _update_preview(self) -> None:
         family = str(self.config.get("appearance.font_family"))
@@ -364,6 +454,31 @@ class PreferencesDialog(Gtk.Dialog):
 
     def _on_fallback_font(self, entry: Gtk.Entry) -> None:
         self.config.set("appearance.fallback_font", entry.get_text().strip())
+        self._apply()
+        self._update_preview()
+
+    def _populate_cjk_families(self) -> None:
+        """Fill the fallback picker with fonts that can render Chinese."""
+        combo = self._cjk_combo
+        combo.remove_all()
+        families = fonts_mod.cjk_families()
+        current = str(self.config.get("appearance.fallback_font") or "")
+        combo.append_text("（不使用）")
+        for family in families:
+            combo.append_text(family)
+        # Keep a configured value selectable even when it is not detected.
+        if current and current not in families:
+            combo.append_text(current)
+        if not current:
+            combo.set_active(0)
+        else:
+            index = families.index(current) + 1 if current in families else len(families) + 1
+            combo.set_active(index)
+
+    def _on_cjk_changed(self, combo: Gtk.ComboBoxText) -> None:
+        text = combo.get_active_text() or ""
+        value = "" if text.startswith("（") else text
+        self.config.set("appearance.fallback_font", value)
         self._apply()
         self._update_preview()
 
@@ -469,6 +584,11 @@ class PreferencesDialog(Gtk.Dialog):
 
         self._add_section(grid, row, "窗口")
         row += 1
+        restore = Gtk.Switch()
+        restore.set_active(bool(self.config.get("behavior.restore_session")))
+        restore.connect("notify::active", self._on_behavior_switch, "restore_session")
+        row = self._add_row(grid, row, "启动时恢复上次的会话", restore)
+
         show_header = Gtk.Switch()
         show_header.set_active(bool(self.config.get("window.show_headerbar")))
         show_header.connect("notify::active", self._on_window_switch, "show_headerbar")
@@ -561,10 +681,21 @@ class PreferencesDialog(Gtk.Dialog):
 
         self._add_section(grid, row, "系统性能面板")
         row += 1
+        note = Gtk.Label(
+            label=(
+                "两个面板现在都是普通分屏：可以用菜单 →「新建…分屏」把它们放到任意位置，"
+                "也能继续往下分屏，或用「当前分屏切换为…」就地换类型。"
+                "下面的开关只控制启动时是否自动开一个面板分屏。"
+            )
+        )
+        note.set_xalign(0.0)
+        note.set_line_wrap(True)
+        note.get_style_context().add_class("vela-dim")
+        row = self._add_row(grid, row, "", note)
         enabled = Gtk.Switch()
         enabled.set_active(bool(self.config.get("sysinfo.enabled")))
         enabled.connect("notify::active", self._on_sysinfo_switch, "enabled")
-        row = self._add_row(grid, row, "显示面板", enabled)
+        row = self._add_row(grid, row, "启动时打开性能分屏", enabled)
 
         interval = Gtk.SpinButton.new_with_range(0.5, 60.0, 0.5)
         interval.set_digits(1)
@@ -592,7 +723,7 @@ class PreferencesDialog(Gtk.Dialog):
         browser = Gtk.Switch()
         browser.set_active(bool(self.config.get("filebrowser.enabled")))
         browser.connect("notify::active", self._on_browser_switch, "enabled")
-        row = self._add_row(grid, row, "显示文件面板", browser)
+        row = self._add_row(grid, row, "启动时打开文件分屏", browser)
 
         follow = Gtk.Switch()
         follow.set_active(bool(self.config.get("filebrowser.follow_terminal")))
